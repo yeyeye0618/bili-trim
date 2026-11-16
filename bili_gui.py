@@ -789,7 +789,7 @@ class App(object):
         self._adb_color = (120, 220, 140, 255) if ok else (240, 120, 120, 255)
         dpg.set_value("adb_state", self._adb_label)
         dpg.configure_item("adb_state", color=self._adb_color)
-        self.log("%s %s" % (APP_NAME, "啟動"))
+        self.log("%s v%s 啟動" % (APP_NAME, ENV.VERSION))
         self.log("adb：%s" % msg)
         if not MED.have_ffmpeg() or not MED.have_ffplay():
             for name in ("ffmpeg", "ffprobe", "ffplay"):

@@ -26,6 +26,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 版本號放這裡：bili_env 是唯一一個每個模組都會載入的共用檔案。
+# 回報問題時附上的 --check 輸出第一行就要寫明是哪一版。
+VERSION = "0.1.0"
+
 HERE = Path(__file__).resolve().parent
 TOOLS_DIR = Path(os.environ.get("BILI_TOOLS") or (HERE / "tools"))
 
@@ -239,6 +243,8 @@ def check():
     setup.py、run.py 和 GUI 都用這一份，不要各寫一套判斷。
     """
     rows = []
+
+    rows.append(("bili-trim", "ok", "v%s  %s" % (VERSION, HERE)))
 
     v = sys.version_info
     ok = v >= (3, 8)
