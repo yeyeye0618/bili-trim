@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+
+# 本機暫存：一支影片就是原檔大小，絕對不要進版控
+bili_gui_stage/
+bili_trim_stage/
+
+# 備份與預覽產物
+*.bilibak
+*.bilibak.part
+preview/
+# --preview-seams 的對照片段（預設就寫在當前目錄）
+*.mp4
+
+# setup.py 下載進來的外部工具（adb / ffmpeg），解開是幾百 MB
+tools/
+
+# setup.py 產生的啟動檔，裡面寫死這台電腦的 Python 路徑
+bili-trim.bat
+bili-trim.sh
+
+# --pack 的產物
+bili-trim-portable.zip

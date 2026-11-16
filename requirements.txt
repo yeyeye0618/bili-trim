@@ -1,0 +1,14 @@
+# 圖形介面
+dearpygui>=2.0,<3
+# 預覽影格的像素搬運（raw texture 要 float32 陣列）
+numpy>=1.24
+# 補字型：B站 標題有 ♡ ❤ 韓文、表情符號，單一系統中文字型補不齊，
+# 缺的字會顯示成「?」。裝了之後程式會自動把韓文與符號合併進字型（只做一次）。
+fonttools>=4.40
+
+# 另外需要兩個外部程式，不是 pip 裝的：
+#   adb     Android SDK Platform-Tools，必要
+#   ffmpeg  只有預覽畫面與匯出接縫片段需要（ffplay 負責預覽的聲音）
+#
+# 這兩個不用自己弄，也不用改 PATH —— 跑 python setup.py 會下載好放進
+# tools/，程式會自己去那裡找。要檢查現在缺什麼：python setup.py --check
