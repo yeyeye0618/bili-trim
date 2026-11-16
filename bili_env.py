@@ -19,8 +19,10 @@ setup.py 會把下載好的 platform-tools 與 ffmpeg 放進 tools/，於是 PAT
 已經把 adb／ffmpeg 加進 PATH 的人也不受影響 —— 第 3 步就會找到。
 """
 
+import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -38,6 +40,21 @@ TOOLS = {
     "ffprobe": ("BILI_FFPROBE", False,
                 "讀不到影片的長寬與時長，預覽會不能用"),
 }
+
+# 缺工具時要告訴使用者去哪裡拿、拿到之後放哪裡。刻意指向官方頁面而不是
+# 直接的檔案連結 —— 連結會過期，頁面不會。
+DOWNLOADS = {
+    "adb": ("Android SDK Platform-Tools",
+            "https://developer.android.com/tools/releases/platform-tools",
+            "解壓後把 adb.exe 和它旁邊的 AdbWinApi.dll、AdbWinUsbApi.dll "
+            "三個檔案一起放進 tools/"),
+    "ffmpeg": ("ffmpeg",
+               "https://ffmpeg.org/download.html",
+               "挑一個包含 ffmpeg／ffplay／ffprobe 的建置，解壓後把這三個"
+               "執行檔放進 tools/"),
+}
+DOWNLOADS["ffplay"] = DOWNLOADS["ffmpeg"]
+DOWNLOADS["ffprobe"] = DOWNLOADS["ffmpeg"]
 
 _cache = {}
 
@@ -131,10 +148,11 @@ def reset():
 
 def missing_hint(name):
     _, need, why = TOOLS.get(name, (None, False, ""))
-    pack = "Android platform-tools" if name == "adb" else "ffmpeg"
+    label, url, howto = DOWNLOADS.get(name, (name, "", ""))
     return ("找不到 %s（%s 這一包）—— %s。\n"
-            "跑一次 python setup.py 就會自動下載放進 tools/，PATH 不用改。"
-            % (name, pack, why))
+            "到 %s 下載，%s —— PATH 不用改。\n"
+            "（也可以跑 python setup.py，它會問要不要幫你下載。）"
+            % (name, label, why, url, howto))
 
 
 # --------------------------------------------------------------------------- #
@@ -148,10 +166,77 @@ PACKAGES = (
 )
 
 
+def probe_modules():
+    """
+    開一個新的行程去 import，而不是在這裡 import，回傳 {套件: 版本或 "!錯誤"}。
+
+    理由是 pip --user 的目標目錄如果在啟動時還不存在，Python 就不會把它
+    放進 sys.path；同一個行程裝完照樣 import 不到，於是明明裝好了卻一路
+    往下報「沒有」。新行程看到的才是使用者開程式時看到的那一份。
+    """
+    code = ("import json, sys\n"
+            "out = {}\n"
+            "for m in ('dearpygui', 'numpy', 'fontTools'):\n"
+            "    try:\n"
+            "        out[m] = getattr(__import__(m), '__version__', '') or 'yes'\n"
+            "    except Exception as e:\n"
+            "        out[m] = '!' + type(e).__name__\n"
+            "sys.stdout.write(json.dumps(out))\n")
+    try:
+        r = subprocess.run([sys.executable, "-c", code], cwd=str(HERE),
+                           capture_output=True, timeout=180)
+        return json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+    except Exception as e:
+        return {m: "!" + type(e).__name__ for m, _, _ in PACKAGES}
+
+
+def refresh_site():
+    """把 pip --user 剛建好的目錄補進 sys.path，不然這個行程一直看不到。"""
+    import importlib
+    import site
+    try:
+        site.main()
+    except Exception:
+        pass
+    try:
+        up = site.getusersitepackages()
+        if isinstance(up, str) and os.path.isdir(up) and up not in sys.path:
+            sys.path.append(up)
+    except Exception:
+        pass
+    importlib.invalidate_caches()
+
+
+def pip_install(args, log=print):
+    """跑 pip，失敗就退回裝到使用者目錄。回傳成功與否。"""
+    def run(extra):
+        try:
+            return subprocess.run([sys.executable, "-m", "pip", "install"]
+                                  + extra + list(args)).returncode == 0
+        except Exception as e:
+            log("跑 pip 出錯：%s" % e)
+            return False
+
+    if run([]):
+        return True
+    # pip 根本不在？先補起來再試
+    try:
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+    if run([]):
+        return True
+    # 系統 Python 被發行版鎖住時（Debian/Ubuntu 的 externally-managed），
+    # 裝到使用者目錄通常就過了。
+    log("再試一次，裝到使用者目錄")
+    return run(["--user"])
+
+
 def check():
     """
     回傳 [(項目, 狀態, 說明)]，狀態是 "ok" / "warn" / "bad"。
-    setup.py 和 GUI 都用這一份，不要各寫一套判斷。
+    setup.py、run.py 和 GUI 都用這一份，不要各寫一套判斷。
     """
     rows = []
 
@@ -160,14 +245,14 @@ def check():
     rows.append(("Python", "ok" if ok else "bad",
                  "%d.%d.%d  %s" % (v[0], v[1], v[2], sys.executable)))
 
+    have = probe_modules()
     for mod, why, need in PACKAGES:
-        try:
-            m = __import__(mod)
-            ver = getattr(m, "__version__", "")
-            rows.append((mod, "ok", ver or why))
-        except Exception as e:
+        v = have.get(mod, "!unknown")
+        if v.startswith("!"):
             rows.append((mod, "bad" if need else "warn",
-                         "沒有 —— %s（%s）" % (why, type(e).__name__)))
+                         "沒有 —— %s（%s）" % (why, v[1:])))
+        else:
+            rows.append((mod, "ok", why if v == "yes" else v))
 
     for name, (_, need, why) in TOOLS.items():
         p = find(name, refresh=True)

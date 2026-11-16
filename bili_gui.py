@@ -475,7 +475,7 @@ class App(object):
                 dpg.add_menu_item(label="這個工具的限制",
                                   callback=lambda: dpg.show_item("win_help"))
                 dpg.add_menu_item(label="環境檢查",
-                                  callback=self.log_env_check)
+                                  callback=self.show_env_window)
 
     def _build_toolbar(self):
         with dpg.group(horizontal=True):
@@ -728,6 +728,26 @@ class App(object):
                 dpg.add_button(label="取消", width=px(96),
                                callback=lambda: dpg.hide_item("win_confirm"))
 
+        with dpg.window(label="環境檢查", tag="win_env", show=False,
+                        modal=True, width=px(900), height=px(560)):
+            dpg.add_text(
+                "這個程式需要兩個外部程式：adb（連手機）和 ffmpeg（預覽畫面）。"
+                "把它們放進專案的 tools/ 資料夾就好，不用改系統的 PATH；"
+                "已經加進 PATH 的也找得到。", wrap=px(870))
+            dpg.add_separator()
+            with dpg.child_window(height=px(-96), tag="env_list"):
+                pass
+            dpg.add_separator()
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="重新檢查", width=px(120),
+                               callback=self.fill_env_window)
+                dpg.add_button(label="開啟 tools 資料夾", width=px(190),
+                               callback=self.open_tools_dir)
+                dpg.add_button(label="把結果寫進訊息區", width=px(190),
+                               callback=self.log_env_check)
+                dpg.add_button(label="關閉", width=px(96),
+                               callback=lambda: dpg.hide_item("win_env"))
+
         with dpg.window(label="這個工具的限制", tag="win_help", show=False,
                         modal=True, width=px(760), height=px(460)):
             dpg.add_text(HELP_TEXT, wrap=px(730))
@@ -779,9 +799,110 @@ class App(object):
         if ok:
             self.refresh_all()
         else:
-            self.log("補好之後按「重新掃描」。"
-                     "想知道還缺什麼：說明 → 環境檢查。")
+            self.log("補好之後按「重新掃描」。")
         self.sync_enabled()
+        # 連不到手機（adb）或看不到畫面（ffmpeg/ffprobe）就等於不能用。
+        # 這種時候不要只在訊息區留一行 —— 直接把「去哪裡拿、放哪裡」
+        # 的視窗開出來，不然使用者只會看到一個什麼都不能按的介面。
+        if not ok or not MED.have_ffmpeg():
+            self.show_env_window()
+
+    STATE_COLOR = {"ok": (120, 220, 140, 255),
+                   "warn": (235, 200, 110, 255),
+                   "bad": (240, 120, 120, 255)}
+
+    def show_env_window(self):
+        self.fill_env_window()
+        # DPG 的 modal 預設貼在左上角，開在畫面中間比較像一回事
+        try:
+            cfg = dpg.get_item_configuration("win_env")
+            vw = dpg.get_viewport_client_width()
+            vh = dpg.get_viewport_client_height()
+            dpg.configure_item("win_env",
+                               pos=[max((vw - cfg["width"]) // 2, 0),
+                                    max((vh - cfg["height"]) // 2, 0)])
+        except Exception:
+            pass
+        dpg.show_item("win_env")
+
+    def env_rows(self):
+        rows = ENV.check()
+        rows.append(("字型", ) + ENV.font_state())
+        return rows
+
+    def fill_env_window(self):
+        """
+        把 ENV.check() 的結果畫出來，缺的東西再補一段「去哪裡拿、放哪裡」。
+        看程式碼的人不會知道要點什麼，所以這裡要把下一步講完 ——
+        連結、資料夾、重新檢查都做成按鈕。
+        """
+        dpg.delete_item("env_list", children_only=True)
+        rows = self.env_rows()
+        for item, state, note in rows:
+            with dpg.group(horizontal=True, parent="env_list"):
+                dpg.add_text(ENV.MARK.get(state, "     ").strip(),
+                             color=self.STATE_COLOR.get(state))
+                dpg.add_text("%-10s" % item)
+                dpg.add_text(note, wrap=px(620))
+
+        missing = [n for n in ("adb", "ffmpeg", "ffplay", "ffprobe")
+                   if not ENV.have(n)]
+        if not missing:
+            dpg.add_separator(parent="env_list")
+            dpg.add_text("兩個外部程式都在，接上手機按「重新掃描」就可以開始。",
+                         parent="env_list", color=self.STATE_COLOR["ok"],
+                         wrap=px(860))
+            return
+
+        # 同一包的只講一次（ffmpeg / ffplay / ffprobe 是一起下載的）
+        shown = set()
+        for name in missing:
+            label, url, howto = ENV.DOWNLOADS[name]
+            if label in shown:
+                continue
+            shown.add(label)
+            dpg.add_separator(parent="env_list")
+            with dpg.group(parent="env_list"):
+                dpg.add_text("缺 %s" % label, color=self.STATE_COLOR["bad"])
+                same = [n for n in missing if ENV.DOWNLOADS[n][0] == label]
+                dpg.add_text("少了：%s" % "、".join(same), wrap=px(860))
+                for n in same:
+                    dpg.add_text("    %s —— %s" % (n, ENV.TOOLS[n][2]),
+                                 wrap=px(840))
+                dpg.add_text("下載：%s" % url, wrap=px(860))
+                dpg.add_text("放法：%s" % howto, wrap=px(860))
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="開啟下載頁", width=px(140),
+                                   callback=lambda s_=None, a_=None, u=url:
+                                   self.open_url(u))
+                    dpg.add_button(label="複製網址", width=px(120),
+                                   callback=lambda s_=None, a_=None, u=url:
+                                   self.copy_text(u))
+
+    def open_tools_dir(self):
+        d = ENV.TOOLS_DIR
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.log("建不出 %s：%s" % (d, e))
+            return
+        self.open_path(d)
+
+    def open_url(self, url):
+        import webbrowser
+        try:
+            webbrowser.open(url)
+        except Exception as e:
+            self.log("打不開 %s：%s" % (url, e))
+            self.copy_text(url)
+
+    def copy_text(self, text):
+        try:
+            dpg.set_clipboard_text(text)
+            self.log("已複製：%s" % text)
+        except Exception:
+            # 舊版 Dear PyGui 沒有剪貼簿 API，至少把字留在訊息區讓人自己複製
+            self.log("複製不了，網址在這裡：%s" % text)
 
     def log_env_check(self):
         """
@@ -790,12 +911,12 @@ class App(object):
         在哪裡、是從 tools/ 還是 PATH 找到的。
         """
         self.log("—— 環境檢查 ——")
-        rows = ENV.check()
-        rows.append(("字型", ) + ENV.font_state())
+        rows = self.env_rows()
         for item, state, note in rows:
             self.log("%s%-10s %s" % (ENV.MARK.get(state, "     "), item, note))
         if ENV.is_fatal(rows):
-            self.log("有必要的東西缺了 —— 在專案資料夾跑：python setup.py")
+            self.log("有必要的東西缺了 —— 看「說明 → 環境檢查」那個視窗，"
+                     "裡面有下載連結與放法。")
         self.log("—— 檢查完畢 ——")
 
     def refresh_all(self):
@@ -2145,7 +2266,8 @@ class App(object):
             if dpg.does_item_exist("lib_filter") else ""
 
         for tag in ("root", "dlg_backup_dir", "dlg_backup_file", "win_restore",
-                    "win_confirm", "win_help", "preview_tex", "tex_reg"):
+                    "win_confirm", "win_help", "win_env", "preview_tex",
+                    "tex_reg"):
             if dpg.does_item_exist(tag):
                 dpg.delete_item(tag)
 

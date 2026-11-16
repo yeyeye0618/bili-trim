@@ -41,6 +41,9 @@ UA = "bili-trim-setup"
 WIN = sys.platform == "win32"
 MAC = sys.platform == "darwin"
 
+# 跟著 repo 一起來的啟動檔。使用者解開 zip 應該只看到一個能點的東西。
+LAUNCHER = "bili-trim.bat"
+
 
 # --------------------------------------------------------------------------- #
 # 輸出
@@ -288,39 +291,15 @@ def check_python():
     return True
 
 
-PKG_WHY = (("dearpygui", "圖形介面", True),
-           ("numpy", "預覽影格", True),
-           ("fontTools", "補字型，缺了標題會出現「?」", False))
-
-
-def _probe_modules():
-    """
-    開一個新的行程去 import，而不是在這裡 import。
-
-    理由是 pip --user 的目標目錄如果在啟動時還不存在，Python 就不會把它
-    放進 sys.path；這個行程裝完套件照樣 import 不到，於是明明裝好了卻
-    一路往下報「沒有」。新行程看到的才是使用者開 GUI 時看到的那一份。
-    """
-    code = ("import json, sys\n"
-            "out = {}\n"
-            "for m in ('dearpygui', 'numpy', 'fontTools'):\n"
-            "    try:\n"
-            "        out[m] = getattr(__import__(m), '__version__', '') or 'yes'\n"
-            "    except Exception as e:\n"
-            "        out[m] = '!' + type(e).__name__\n"
-            "sys.stdout.write(json.dumps(out))\n")
-    try:
-        r = subprocess.run([sys.executable, "-c", code], cwd=str(HERE),
-                           capture_output=True, timeout=180)
-        return json.loads(r.stdout.decode("utf-8", "replace") or "{}")
-    except Exception as e:
-        warn("檢查套件時出錯：%s" % e)
-        return {}
+def _env():
+    """bili_env 到這裡一定讀得到（main 開頭就驗過了）。"""
+    import bili_env
+    return bili_env
 
 
 def _report_modules(have):
     missing = []
-    for mod, why, need in PKG_WHY:
+    for mod, why, need in _env().PACKAGES:
         v = have.get(mod, "!unknown")
         if v.startswith("!"):
             (bad if need else warn)("%s 沒有 —— %s" % (mod, why))
@@ -330,25 +309,8 @@ def _report_modules(have):
     return missing
 
 
-def _refresh_site():
-    """把 pip --user 剛建好的目錄補進 sys.path，不然這個行程一直看不到。"""
-    import importlib
-    import site
-    try:
-        site.main()
-    except Exception:
-        pass
-    try:
-        up = site.getusersitepackages()
-        if isinstance(up, str) and os.path.isdir(up) and up not in sys.path:
-            sys.path.append(up)
-    except Exception:
-        pass
-    importlib.invalidate_caches()
-
-
 def check_packages():
-    need = _report_modules(_probe_modules())
+    need = _report_modules(_env().probe_modules())
     if not need:
         return True
 
@@ -356,41 +318,23 @@ def check_packages():
     args = (["-r", str(req)] if req.is_file()
             else ["dearpygui", "numpy", "fonttools"])
     say("用這個直譯器安裝：%s" % sys.executable)
-    done = _pip(["install"] + args)
-    if not done:
-        # 系統 Python 被發行版鎖住時（Debian/Ubuntu 的 externally-managed），
-        # 裝到使用者目錄通常就過了。
-        warn("再試一次，裝到使用者目錄")
-        done = _pip(["install", "--user"] + args)
+    done = _env().pip_install(args, log=warn)
     if done:
-        _refresh_site()
+        _env().refresh_site()
         print("")
         say("再確認一次（用新的行程，確定開程式時真的 import 得到）：")
-        left = _report_modules(_probe_modules())
+        left = _report_modules(_env().probe_modules())
         if not [m for m, req in left if req]:
             return True
         bad("pip 說裝好了，但新的行程還是 import 不到。")
-        say("這通常是同一台電腦上有多個 Python。開程式請用 setup.py 產生的"
-            "啟動檔（bili-trim.bat），它寫死的就是這一個：")
+        say("這通常是同一台電腦上有多個 Python。請用 %s 開程式 —— "
+            "它會讀 python-path.txt，裡面記的就是這一個：" % LAUNCHER)
         say("    %s" % sys.executable)
         return False
     bad("pip 裝不起來。建議改用虛擬環境：")
     say('    "%s" -m venv .venv' % sys.executable)
     say("    .venv/Scripts/python setup.py" if WIN
         else "    .venv/bin/python setup.py")
-    return False
-
-
-def _pip(args):
-    try:
-        if subprocess.run([sys.executable, "-m", "pip"] + args).returncode == 0:
-            return True
-        # pip 根本不在？先把它補起來再試一次
-        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return subprocess.run([sys.executable, "-m", "pip"] + args).returncode == 0
-    except Exception as e:
-        bad("跑 pip 出錯：%s" % e)
     return False
 
 
@@ -491,7 +435,7 @@ def check_font():
 
 def _fonttools_problem_fresh():
     """
-    同樣開新行程問 —— 理由跟 _probe_modules 一樣。這裡要是判斷錯，
+    同樣開新行程問 —— 理由跟 bili_env.probe_modules 一樣。這裡要是判斷錯，
     結果是「剛裝好 fonttools 卻跳過合併字型」，使用者下次開程式滿滿的「?」。
     """
     code = ("import sys\n"
@@ -512,28 +456,22 @@ def _fonttools_problem_fresh():
 
 def write_launcher():
     """
-    記住「跑 setup.py 的那個直譯器」。一台電腦上常常有好幾個 Python
-    （商店版、python.org 版、conda…），套件裝在哪一個就要用哪一個開，
-    不然就是明明裝好了卻說找不到 dearpygui。
+    記住「跑 setup.py 的那個直譯器」，寫進 python-path.txt。
+
+    啟動檔（bili-trim.bat）本身是跟著 repo 一起來的，不是產生的 ——
+    使用者解開 zip 就要看得到一個能點的東西。這裡只負責告訴它該用哪一個
+    Python：一台電腦上常常有好幾個（市集版、python.org 版、conda…），
+    套件裝在哪一個就要用哪一個開，不然就是明明裝好了卻說找不到 dearpygui。
     """
-    if WIN:
-        p = HERE / "bili-trim.bat"
-        body = ("@echo off\r\n"
-                "chcp 65001 >nul\r\n"
-                "rem 由 setup.py 產生。重跑 setup.py 會覆寫這個檔案。\r\n"
-                'cd /d "%~dp0"\r\n'
-                '"' + sys.executable + '" bili_gui.py %*\r\n'
-                "if errorlevel 1 pause\r\n")
-        p.write_bytes(body.encode("utf-8"))
-    else:
-        p = HERE / "bili-trim.sh"
-        body = ("#!/bin/sh\n"
-                "# 由 setup.py 產生。重跑 setup.py 會覆寫這個檔案。\n"
-                'cd "$(dirname "$0")" || exit 1\n'
-                'exec "' + sys.executable + '" bili_gui.py "$@"\n')
-        p.write_text(body, encoding="utf-8")
-        os.chmod(str(p), 0o755)
-    ok("啟動檔：%s" % p.name)
+    p = HERE / "python-path.txt"
+    try:
+        # 刻意不寫換行：批次檔是用 set /p 讀的，結尾的 CR 會被當成路徑的
+        # 一部分，然後「檔案不存在」。
+        p.write_text(sys.executable, encoding="utf-8", newline="")
+    except OSError as e:
+        warn("寫不進 %s：%s" % (p.name, e))
+        return None
+    ok("啟動用的 Python 記在 %s" % p.name)
     return p
 
 
@@ -839,10 +777,9 @@ SKIP_DIRS = {"__pycache__", "bili_gui_stage", "bili_trim_stage", "preview",
              ".git", ".venv", "_download"}
 SKIP_SUFFIX = (".bilibak", ".part", ".pyc", ".lnk", ".log", ".zip")
 
-# 啟動檔裡寫死的是「打包那台電腦」的 Python 路徑，帶過去只會讓人在
-# 還沒跑 setup 之前點它，然後看到一句看不懂的「不是內部或外部命令」。
-# 新電腦跑 setup 時本來就會重新產生，所以不要包。
-SKIP_NAMES = {"bili-trim.bat", "bili-trim.sh"}
+# python-path.txt 記的是「打包那台電腦」的 Python 路徑，帶過去會指到
+# 一個不存在的檔案。啟動檔自己會處理這種情況，但乾脆別包進去。
+SKIP_NAMES = {"python-path.txt"}
 
 
 def pack(out, with_tools=True):
@@ -967,7 +904,7 @@ def do_check(env):
     else:
         print("電腦這邊沒問題，手機那邊還沒接好（看上面 [--] 的說明）。")
     print("")
-    print("開 GUI：python bili_gui.py")
+    print("開程式：%s" % (LAUNCHER if WIN else "python3 run.py"))
     return 0
 
 
@@ -1024,8 +961,8 @@ def main():
     check_font()
 
     step("啟動方式")
-    launcher = write_launcher()
-    make_shortcut(launcher)
+    write_launcher()
+    make_shortcut(HERE / LAUNCHER)
 
     step("設定")
     cfg_ok = setup_config()
@@ -1034,7 +971,7 @@ def main():
     step("手機")
     dev_ok, usable = setup_device(env)
 
-    how = launcher.name if WIN else "./" + launcher.name
+    how = LAUNCHER if WIN else "python3 run.py"
     print("")
     if not (pkg_ok and tool_ok):
         print("還有東西沒裝成功（上面標 [!!] 的）。修好之後再跑一次：")

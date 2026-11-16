@@ -15,9 +15,8 @@ preview/
 # setup.py 下載進來的外部工具（adb / ffmpeg），解開是幾百 MB
 tools/
 
-# setup.py 產生的啟動檔，裡面寫死這台電腦的 Python 路徑
-bili-trim.bat
-bili-trim.sh
+# setup.py 記下它用的那個 Python（啟動檔會讀這個檔案）
+python-path.txt
 
 # --pack 的產物
 bili-trim-portable.zip

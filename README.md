@@ -10,7 +10,9 @@ videos still play inside the Bilibili app — same player, same danmaku, same
 resume position. Chinese-only UI and docs.*
 
 ```
-setup.py        一個命令把環境裝起來（也負責打包帶去別台電腦）
+bili-trim.bat   點兩下就開始（找 Python → run.py）
+run.py          入口：驗 Python 版本、補缺的套件，然後開視窗
+setup.py        命令列版的安裝，另外負責打包帶去別台電腦
 bili_gui.py     圖形介面（挑廣告、即時預覽、一鍵寫回手機）
 bili_trim.py    剪輯引擎 + 命令列版本（純標準庫，不需要 ffmpeg）
 bili_device.py  adb：找裝置、找 B站 路徑、列緩存、拉取／推送
@@ -85,52 +87,68 @@ bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 
 ---
 
-## 安裝
+## 開始用
+
+1. 下載這個專案：**Code → Download ZIP**，解壓到你自己的資料夾
+   （桌面、文件都可以，不要放 `Program Files`，那裡寫不進去）
+2. **點兩下 `bili-trim.bat`**
+3. 第一次會問要不要裝三個 Python 套件，按 Enter 就好
+4. 程式開起來。少了 `adb` 或 `ffmpeg` 的話，它會自己跳出**環境檢查**視窗，
+   列出缺什麼、去哪裡下載、放到哪個資料夾，旁邊就是按鈕
+5. 手機接上電腦、開「USB 偵錯」，按**重新掃描**
+
+沒有 Python 的話，第 2 步會告訴你去裝；裝完再點一次同一個檔案。
+（`winget install -e --id Python.Python.3.12`，或到
+[python.org](https://www.python.org/downloads/) 下載，安裝畫面最下面
+記得勾 **Add python.exe to PATH**。）
+
+### 要自己準備的兩個外部程式
+
+這兩個不是 pip 裝得到的東西，請自己下載 —— 程式不會偷偷幫你抓：
+
+| | 去哪裡拿 | 放哪裡 | 沒有的話 |
+| --- | --- | --- | --- |
+| **adb** | [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools) | `tools/` 裡放 `adb.exe` 和旁邊的 `AdbWinApi.dll`、`AdbWinUsbApi.dll` | 完全不能用 |
+| **ffmpeg** | [ffmpeg.org](https://ffmpeg.org/download.html) | `tools/` 裡放 `ffmpeg`、`ffplay`、`ffprobe` 三個執行檔 | 預覽不能用，剪輯還是可以 |
+
+**不用改 PATH。** 程式先看專案裡的 `tools/`，再看 PATH ——
+已經有 adb／ffmpeg 的人不受影響，沒有的人也不必去翻「系統環境變數」。
+那是這個專案以前最大的摩擦：下載、解壓、新增一列、重開終端機，
+任何一步漏掉，看到的都只是一句「找不到 adb」，而且看不出是哪一步錯。
+
+要放在別的地方也行：環境變數 `BILI_TOOLS` 指到那個資料夾，或是
+`BILI_ADB` / `BILI_FFMPEG` / `BILI_FFPLAY` / `BILI_FFPROBE` 直接指到執行檔。
+
+### 不想一步一步來
 
 ```bash
 python setup.py
 ```
 
-Windows 上不想開終端機的話，**點兩下 `setup.bat`** 也是一樣的（它只做一件事：
-找到一個能用的 Python，再把 `setup.py` 交給它）。
-
-跑完就是可以用的狀態 —— 它會一路做到「手機接上、緩存影片列得出來」為止：
+命令列版的安裝，一路做到「接上手機、影片列得出來」為止。比點兩下多做這些事：
 
 | 步驟 | 內容 |
 | --- | --- |
-| Python 套件 | `dearpygui`、`numpy`、`fonttools`，裝到「現在跑的這個」直譯器 |
-| 外部工具 | 下載 adb 與 ffmpeg 放進 `tools/`（會先問你） |
-| 字型 | 把韓文與符號合併進中文字型，約半分鐘，只做一次 |
-| 啟動檔 | 產生 `bili-trim.bat`，裡面寫死剛剛那個 Python 的路徑 |
+| Python 套件 | 裝到「現在跑的這個」直譯器 |
+| 外部工具 | **問過你之後**才從官方來源下載，放進 `tools/` |
+| 字型 | 先把韓文與符號合併進中文字型（約半分鐘），省得第一次開程式時等 |
+| 啟動方式 | 把它用的那個 Python 記進 `python-path.txt`，啟動檔會優先讀它 |
 | 設定 | 問備份位置、建好資料夾、寫進設定檔 |
 | 手機 | 等你把 USB 偵錯打開並授權，然後找 B站 的緩存目錄、列一次影片 |
 
 最後一步會**一直等**，不是檢查一次就放棄 —— 使用者的時間都花在手機上
 （連點七次版本號碼、翻開發人員選項、按授權對話框），檢查一次就說
 「沒偵測到手機」等於叫人自己重跑。沒接手機、接了沒授權、offline，
-三種狀態的下一步都不一樣，所以會分開講。
+三種狀態的下一步都不一樣，所以會分開講。它也會分清楚「手機上沒裝 B站」
+和「裝了但下載目錄還不存在」（目錄要在 App 裡下載過一支影片才會建出來）。
 
-它也會分清楚「手機上沒裝 B站」和「裝了但下載目錄還不存在」
-（目錄要在 App 裡下載過一支影片才會建出來）—— 這兩個看起來一樣，
-但要做的事完全不同。
-
-**不會動你的 PATH。** 下載來的 adb 與 ffmpeg 放在專案的 `tools/` 裡，
-程式自己會去那裡找（`tools/` 優先，再找 PATH）。所以已經有 adb／ffmpeg 的人
-不受影響，而沒有的人也不必去翻「系統環境變數」—— 那是這個專案以前最大的
-部署摩擦：下載、解壓、新增一列、重開終端機，任何一步漏掉，看到的結果
-都只是一句「找不到 adb」，而且看不出是哪一步錯。
-
-啟動檔寫死直譯器路徑是因為一台電腦常常有好幾個 Python（市集版、
-python.org 版、conda…）。套件裝在哪一個，就得用哪一個開，不然就會
+`python-path.txt` 這件事是因為一台電腦常常有好幾個 Python（市集版、
+python.org 版、conda…）。套件裝在哪一個就要用哪一個開，不然就會
 「明明裝好了卻說找不到 dearpygui」。
 
-裝完的狀態是：套件就位、`tools/` 裡有 adb 與 ffmpeg、字型合併好、
-設定檔已經寫好備份位置、`bili-trim.bat` 可以直接點。接上手機開程式按
-**重新掃描**就會列出影片。
-
-其他選項：`--check` 只檢查不動手、`--yes` 所有詢問都當同意、
-`--offline` 不下載、`--skip-font` 不建字型、`--backup-dir PATH` 直接指定
-備份位置、`--pack` 打包（見下一節）。
+其他選項：`--check` 只檢查不動手、`--yes` 所有詢問都當同意、`--offline`
+不下載、`--skip-font` 不建字型、`--backup-dir PATH` 直接指定備份位置、
+`--pack` 打包（見下一節）。
 
 ### 帶去另一台電腦
 
@@ -139,46 +157,33 @@ python setup.py --pack
 ```
 
 產生 `bili-trim-portable.zip`，**連 `tools/` 一起包進去**（加 `--no-tools`
-可以不包）。在新電腦解壓之後點兩下 `setup.bat`，因為工具已經在裡面了，
-它只會補 Python 套件和字型，不用再下載一百多 MB。
+可以不包）。在新電腦解壓之後點兩下 `bili-trim.bat`，因為工具已經在裡面了，
+不用再下載一次。
+
+> 這個包是給自己搬家用的，不適合公開散佈 —— 裡面的 ffmpeg 多半是 GPL
+> 授權的建置，platform-tools 也有自己的條款，跟本專案的 MIT 不是同一回事。
 
 ### 出問題的時候
+
+程式裡：**說明 → 環境檢查**。逐項列出 Python、三個套件、
+adb／ffmpeg／ffplay／ffprobe、合併字型、備份位置，缺的東西下面就是下載
+連結和「開啟 tools 資料夾」按鈕。按**把結果寫進訊息區**可以複製整段貼出來。
+
+命令列：
 
 ```bash
 python setup.py --check
 ```
 
-會逐項列出 Python、三個套件、adb／ffmpeg／ffplay／ffprobe、合併字型、
-備份位置，各自在不在、在哪裡、是從 `tools/` 還是 PATH 找到的；接著看一次
-手機，連得上就順便把緩存目錄和影片數量也列出來（這一個不等）。
+同一份檢查，外加看一次手機：連得上就把緩存目錄和影片數量也列出來。
 
-兩個刻意不偷懒的地方：
+兩個刻意不偷懶的地方：
 
 - **工具會真的執行一次問版本**，不只看檔案在不在。被防毒軟體隔離、
   抄到一半、少了旁邊的 dll，這些情況檔案都還在，但一跑就死。
 - **套件是開一個新的行程去 import**。`pip --user` 的目標目錄如果在啟動時
   還不存在，Python 就不會把它放進 `sys.path`，於是同一個行程裝完照樣
   `import` 不到 —— 在自己這裡判斷會得到「剛裝好卻說沒裝」的錯誤結論。
-
-程式裡也有同一份檢查：**說明 → 環境檢查**，結果直接寫進訊息區。
-字型的問題另外有一份更細的報告：`python bili_gui.py --check-font`。
-
-### 自己來（不想用 setup.py）
-
-需要 Python 3.8+、adb、ffmpeg。
-
-```bash
-pip install -r requirements.txt
-```
-
-- **adb** — [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)，
-  解壓後把資料夾加入 `PATH`，或是直接丟進專案的 `tools/`。
-  手機要開啟「USB 偵錯」並允許這台電腦。
-- **ffmpeg** — 只有預覽畫面與匯出接縫片段需要，剪輯本身不用。
-  `ffplay`（同一包）負責預覽的聲音。
-- 想把工具放在別的地方：環境變數 `BILI_TOOLS` 指到那個資料夾，
-  或是 `BILI_ADB` / `BILI_FFMPEG` / `BILI_FFPLAY` / `BILI_FFPROBE`
-  直接指到執行檔。
 
 ### 關於字型
 
@@ -187,15 +192,15 @@ Android 顯示得出來是因為系統有字型後備鏈，但 Dear PyGui 一次
 缺的字會畫成 `?` —— 而且掃過本機所有大字型，涵蓋最好的也還缺 7 個字。
 
 所以會把韓文與符號從其他系統字型子集化之後**合併成一個字型檔**（約半分鐘，
-之後快取起來不用再做）。`setup.py` 會做這件事；沒做的話第一次啟動 GUI
-它也會在背景自己建。這需要 `fonttools`，沒裝也能跑，只是那些字會顯示成 `?`。
-合併結果放在 `%APPDATA%\bili_trim_gui\fonts\`。
+之後快取起來不用再做）。第一次開程式它會在背景自己建；`setup.py` 會先做好。
+這需要 `fonttools`，沒裝也能跑，只是那些字會顯示成 `?`。合併結果放在
+`%APPDATA%\bili_trim_gui\fonts\`。
 
 還是看到 `?` 的話，跑這個會告訴你卡在哪裡 —— 用的是哪個 Python、補字字型
 建好了沒、以及手機上每一筆標題還缺哪些字元：
 
 ```bash
-python bili_gui.py --check-font
+bili-trim.bat --check-font
 ```
 
 ---
@@ -204,15 +209,9 @@ python bili_gui.py --check-font
 
 ### 圖形介面
 
-```bash
-python bili_gui.py
-```
+點兩下 `bili-trim.bat`（或 `python run.py`）。
 
-（跑過 `setup.py` 的話，點兩下 `bili-trim.bat` 也是一樣的，而且不用管
-電腦上有幾個 Python。）
-
-1. 接上手機，按**重新掃描** —— 會自己找 B站 的緩存目錄、列出所有影片，
-   並標出哪些已經剪過了
+1. 接上手機，按**重新掃描** —— 會自己找 B站 的緩存目錄、列出所有影片
 2. 選一支，按**載入以編輯**（從手機拉到本機暫存，之後重用不必再拉）
 3. 拖時間軸找廣告：滾輪縮放、拖空白處平移、點一下跳到該處，
    `I` / `O` 設起訖點，**加入移除區間**
