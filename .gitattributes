@@ -5,3 +5,8 @@
 # 整個檔案會以很難看懂的方式壞掉（實測過）。-text = git 完全不要碰它的
 # 換行，所以 clone 和「從 GitHub 下載 ZIP」拿到的都是原樣。
 *.bat -text
+
+# 字型是二進位檔
+*.ttf binary
+*.png binary
+*.ico binary

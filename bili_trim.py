@@ -57,6 +57,9 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+# 從沒有主控台的 exe 呼叫 ffmpeg / adb 時，不加這個每次都會閃一個黑色視窗
+_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
 import bili_env as ENV
 
 for _s in (sys.stdout, sys.stderr):
@@ -770,14 +773,16 @@ def make_previews(v_bytes, a_bytes, v_src, a_src, snapped, seam_window,
         new_mp4 = work / "new.mp4"
         r = subprocess.run([ENV.path("ffmpeg"), "-v", "error", "-y", "-i", str(nv),
                             "-i", str(na), "-c", "copy", str(new_mp4)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True,
+                           creationflags=_NO_WINDOW)
         if r.returncode:
             print("\n預覽失敗（新檔合併不起來）：%s" % r.stderr.strip()[:300])
             return
         orig_mp4 = work / "orig.mp4"
         r = subprocess.run([ENV.path("ffmpeg"), "-v", "error", "-y", "-i", str(v_src),
                             "-i", str(a_src), "-c", "copy", str(orig_mp4)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True,
+                           creationflags=_NO_WINDOW)
         have_orig = r.returncode == 0
 
         def grab(src, start, length, dst, label):
@@ -787,10 +792,12 @@ def make_previews(v_bytes, a_bytes, v_src, a_src, snapped, seam_window,
             rr = subprocess.run(base + ["-c:v", "libx264", "-preset", "veryfast",
                                         "-crf", "22", "-c:a", "aac", "-b:a",
                                         "128k", str(dst)],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True,
+                           creationflags=_NO_WINDOW)
             if rr.returncode:
                 rr = subprocess.run(base + ["-c", "copy", str(dst)],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True,
+                           creationflags=_NO_WINDOW)
             if rr.returncode:
                 print("  %s 擷取失敗：%s" % (label, rr.stderr.strip()[:200]))
                 return False
@@ -938,7 +945,8 @@ def adb(*args, **kw):
     import subprocess
     binary = kw.pop("binary", False)
     r = subprocess.run([ENV.path("adb")] + list(args),
-                       capture_output=True, env=_adb_env())
+                       capture_output=True, env=_adb_env(),
+                           creationflags=_NO_WINDOW)
     if r.returncode:
         raise RuntimeError("adb %s 失敗：%s"
                            % (" ".join(args),

@@ -13,9 +13,13 @@ bili_config.py — GUI 的設定檔（%APPDATA%/bili_trim_gui/settings.json）�
 
 import json
 import os
+import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# exe 版的暫存影片放在 exe 旁邊（原始碼被解到暫存資料夾，放那裡會被刪掉）
+APP_DIR = (Path(sys.executable).resolve().parent
+           if getattr(sys, "frozen", False) else HERE)
 
 DEFAULT_FONT_PT = 17
 
@@ -32,7 +36,7 @@ CONFIG_PATH = config_dir() / "settings.json"
 
 DEFAULTS = {
     "backup_dir": str(Path.home() / "Documents" / "bili_backups"),
-    "stage_dir": str(HERE / "bili_gui_stage"),
+    "stage_dir": str(APP_DIR / "bili_gui_stage"),
     "preview_quality": "原生解析度",
     "font_pt": DEFAULT_FONT_PT,
     "snap": "outer",

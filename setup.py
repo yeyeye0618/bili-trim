@@ -403,28 +403,30 @@ def check_font():
     except Exception as e:
         warn("讀不到 bili_font：%s" % e)
         return
-    base = BF.base_font()
-    if base is None:
+    res = BF.resolve(make=False)
+    if res["body"] is None:
         warn("找不到中文字型，標題大概會整排都是「?」")
         return
-    say("底字型 %s" % base)
+    say("內文字型 %s" % res["body"])
     problem = _fonttools_problem_fresh()
     if problem:
-        warn("不能合併字型（%s）—— ♡ ❤ 韓文、表情會顯示成「?」" % problem)
+        warn("不能做介面字型（%s）—— 會用系統字型，♡ ❤ 韓文、表情會顯示成「?」"
+             % problem)
         return
-    have = BF.cached(base)
-    if have and not FLAGS.force_font:
-        ok("合併字型已經建好：%s（%s）"
-           % (have.name, _human(have.stat().st_size)))
+    if not res["pending"] and not FLAGS.force_font:
+        ok("介面字型已經做好：%s"
+           % "、".join(p.name for p in (res["body"], res["serif"], res["num"])
+                      if p))
         return
     if FLAGS.skip_font:
-        warn("--skip-font，跳過。第一次開 GUI 它會自己在背景建。")
+        warn("--skip-font，跳過。第一次開 GUI 它會自己在背景做。")
         return
-    if not ask("要現在把韓文與符號合併進字型嗎？（約半分鐘，只做一次）"):
-        say("跳過。第一次開 GUI 它會自己在背景建。")
+    if not ask("要現在把介面字型準備好嗎？（固定 Noto 的字重、補簡體字與韓文，"
+               "約一分鐘，只做一次）"):
+        say("跳過。第一次開 GUI 它會自己在背景做。")
         return
     # 開新行程來建：剛剛才裝好的 fontTools，這個行程的 sys.path 可能還看不到。
-    cmd = [sys.executable, str(HERE / "bili_font.py"), base]
+    cmd = [sys.executable, str(HERE / "bili_font.py")]
     if FLAGS.force_font:
         cmd.append("--force")
     if subprocess.run(cmd, cwd=str(HERE)).returncode == 0:
@@ -774,7 +776,7 @@ def setup_config():
 # --------------------------------------------------------------------------- #
 
 SKIP_DIRS = {"__pycache__", "bili_gui_stage", "bili_trim_stage", "preview",
-             ".git", ".venv", "_download"}
+             ".git", ".venv", "_download", "build", "dist", ".impeccable"}
 SKIP_SUFFIX = (".bilibak", ".part", ".pyc", ".lnk", ".log", ".zip")
 
 # python-path.txt 記的是「打包那台電腦」的 Python 路徑，帶過去會指到
@@ -808,11 +810,77 @@ def pack(out, with_tools=True):
     ok("包好了：%s" % out)
     print("")
     print("帶到新電腦之後，在那邊解壓，然後：")
-    print("    Windows   點兩下 setup.bat")
+    print("    Windows   點兩下 bili-trim.bat")
     print("    其他系統  python3 setup.py")
     if with_tools and (HERE / "tools").is_dir():
         print("")
         print("（tools/ 一起包進去了，所以新電腦不必再下載 adb 跟 ffmpeg）")
+
+
+# --------------------------------------------------------------------------- #
+# 做成 exe
+# --------------------------------------------------------------------------- #
+
+EXE_NAME = "bili-trim"
+
+
+def build_exe(env):
+    """
+    用 PyInstaller 把整個程式（Python、dearpygui、numpy、fonttools、Barlow 字型）
+    封成一個 exe。對方的電腦不用裝 Python。
+
+    adb 和 ffmpeg 不封進去：ffmpeg 常見的 Windows 建置是 GPL，platform-tools
+    有自己的條款，跟本專案的 MIT 不能混在一個檔案裡散佈。exe 會在它旁邊的
+    tools/ 找，找不到再看 PATH —— 跟原始碼版一樣。
+    """
+    if os.name != "nt":
+        warn("exe 只做 Windows 版。其他系統用 python3 run.py 就好。")
+        return 1
+    have = subprocess.run([sys.executable, "-c", "import PyInstaller"],
+                          capture_output=True).returncode == 0
+    if not have:
+        if not ask("要裝 PyInstaller 嗎？（把 Python 程式封成 exe 的工具）"):
+            say("沒有 PyInstaller 做不了 exe。")
+            return 1
+        if not env.pip_install(["pyinstaller"]):
+            warn("PyInstaller 裝不起來。")
+            return 1
+
+    dist, work = HERE / "dist", HERE / "build"
+    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
+           "--onefile", "--windowed", "--name", EXE_NAME,
+           "--distpath", str(dist), "--workpath", str(work),
+           "--specpath", str(work),
+           # Barlow 字型封進去；執行時解到 sys._MEIPASS/fonts
+           "--add-data", "%s%sfonts" % (HERE / "fonts", os.pathsep),
+           # fontTools 很多表格是用名字動態 import 的，靜態分析抓不到
+           "--collect-submodules", "fontTools",
+           "--collect-all", "dearpygui",
+           "--exclude-module", "tkinter",
+           # exe 檔案本身的圖示，以及視窗標題列用的同一個檔案
+           "--icon", str(HERE / "assets" / "bili-trim.ico"),
+           "--add-data", "%s%sassets" % (HERE / "assets" / "bili-trim.ico",
+                                         os.pathsep),
+           str(HERE / "run.py")]
+    say("打包中（第一次大約一兩分鐘）…")
+    r = subprocess.run(cmd, cwd=str(HERE), capture_output=True)
+    exe = dist / (EXE_NAME + ".exe")
+    if r.returncode or not exe.is_file():
+        tail = r.stderr.decode("utf-8", "replace").strip().splitlines()[-15:]
+        warn("打包失敗：")
+        for line in tail:
+            print("    " + line)
+        return 1
+    ok("做好了：%s（%s）" % (exe, _human(exe.stat().st_size)))
+    print("")
+    print("拿去用的時候：")
+    print("    1. 把 %s 放到任何資料夾（不要放 Program Files，那裡寫不進去）" % exe.name)
+    print("    2. adb 和 ffmpeg：已經在 PATH 裡就不用管；沒有的話在 exe 旁邊建一個")
+    print("       tools 資料夾，把 adb.exe（連同兩個 dll）和 ffmpeg / ffplay / ffprobe 放進去")
+    print("    3. 點兩下 %s" % exe.name)
+    print("")
+    print("剪輯時從手機拉下來的暫存會放在 exe 旁邊的 bili_gui_stage 資料夾。")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -924,6 +992,8 @@ def main():
                     metavar="ZIP", help="打包成一個 zip 帶去別台電腦")
     ap.add_argument("--no-tools", action="store_true",
                     help="--pack 時不要把 tools/ 包進去")
+    ap.add_argument("--exe", action="store_true",
+                    help="做成一個 exe（不用裝 Python 就能跑）")
     ap.add_argument("--backup-dir", metavar="PATH",
                     help="備份位置，不給就問（或沿用現有設定）")
     FLAGS = ap.parse_args()
@@ -934,6 +1004,10 @@ def main():
     except Exception as e:
         print("讀不到 bili_env.py（%s）—— 這個檔案要跟專案放在一起。" % e)
         return 2
+
+    if FLAGS.exe:
+        print("做 exe：%s" % HERE)
+        return build_exe(env)
 
     if FLAGS.pack:
         print("打包 %s" % HERE)

@@ -31,7 +31,13 @@ from pathlib import Path
 VERSION = "0.1.0"
 
 HERE = Path(__file__).resolve().parent
-TOOLS_DIR = Path(os.environ.get("BILI_TOOLS") or (HERE / "tools"))
+
+# 打包成 exe（PyInstaller）的時候，原始碼被解到一個暫存資料夾，每次開都不一樣、
+# 關掉就刪掉。tools/、暫存影片這些要跟著「exe 放在哪」走，不能跟著 __file__。
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE
+
+TOOLS_DIR = Path(os.environ.get("BILI_TOOLS") or (APP_DIR / "tools"))
 
 # 每個工具：環境變數名、是否必要、缺了會怎樣
 TOOLS = {
@@ -178,6 +184,16 @@ def probe_modules():
     放進 sys.path；同一個行程裝完照樣 import 不到，於是明明裝好了卻一路
     往下報「沒有」。新行程看到的才是使用者開程式時看到的那一份。
     """
+    if FROZEN:
+        # exe 裡的 sys.executable 就是 exe 本身，拿它去跑 -c 只會再開一個程式。
+        # 套件都封在 exe 裡了，直接在這裡問就好。
+        out = {}
+        for m, _, _ in PACKAGES:
+            try:
+                out[m] = getattr(__import__(m), "__version__", "") or "yes"
+            except Exception as e:
+                out[m] = "!" + type(e).__name__
+        return out
     code = ("import json, sys\n"
             "out = {}\n"
             "for m in ('dearpygui', 'numpy', 'fontTools'):\n"
@@ -244,12 +260,14 @@ def check():
     """
     rows = []
 
-    rows.append(("bili-trim", "ok", "v%s  %s" % (VERSION, HERE)))
+    rows.append(("bili-trim", "ok", "v%s  %s%s" % (
+        VERSION, sys.executable if FROZEN else HERE, "（exe）" if FROZEN else "")))
 
     v = sys.version_info
     ok = v >= (3, 8)
     rows.append(("Python", "ok" if ok else "bad",
-                 "%d.%d.%d  %s" % (v[0], v[1], v[2], sys.executable)))
+                 "%d.%d.%d  %s" % (v[0], v[1], v[2],
+                                   "封在 exe 裡" if FROZEN else sys.executable)))
 
     have = probe_modules()
     for mod, why, need in PACKAGES:
@@ -288,16 +306,17 @@ def font_state():
     problem = bili_font.fonttools_problem()
     if problem:
         return "warn", "不能合併字型：%s" % problem
-    base = bili_font.base_font()
-    if base is None:
-        return "bad", "找不到任何中文字型，標題會整排都是「?」"
     try:
-        c = bili_font.cached(base)
+        res = bili_font.resolve(make=False)
     except Exception as e:
-        return "warn", "檢查快取失敗：%s" % e
-    if c:
-        return "ok", "%s（%.1f MB）" % (c.name, c.stat().st_size / 1e6)
-    return "warn", "還沒建（第一次開 GUI 會自己建，或跑 python setup.py）"
+        return "warn", "檢查字型失敗：%s" % e
+    if res["body"] is None:
+        return "bad", "找不到任何中文字型，標題會整排都是「?」"
+    if res["pending"]:
+        return "warn", ("介面字型還沒做好（%s）—— 第一次開 GUI 會自己做，"
+                        "或跑 python setup.py" % "、".join(res["pending"]))
+    faces = [p for p in (res["body"], res["serif"], res["num"]) if p]
+    return "ok", "、".join(p.name for p in faces)
 
 
 def is_fatal(rows):

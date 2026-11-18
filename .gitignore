@@ -20,3 +20,14 @@ python-path.txt
 
 # --pack 的產物
 bili-trim-portable.zip
+
+# 介面審查的截圖（示範資料，但環境檢查那張有本機路徑）
+.impeccable/review/
+
+# --exe 的產物（PyInstaller）
+build/
+dist/
+
+# Impeccable 設計流程的本機狀態（草稿本身也不進版控）
+.impeccable/config.json
+.impeccable/decision-payload.json

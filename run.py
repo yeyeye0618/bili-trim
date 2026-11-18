@@ -122,7 +122,47 @@ def ensure_packages(env):
     return True
 
 
+def _fatal(text):
+    """
+    exe 版沒有主控台：開不起來的時候錯誤會無聲無息地消失。寫一份記錄，
+    再跳一個 Windows 的訊息框，至少讓人知道發生了什麼、記錄在哪裡。
+    """
+    log = None
+    try:
+        import bili_config
+        d = bili_config.config_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        log = d / "bili-trim-error.log"
+        log.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+    msg = "bili-trim 開不起來。\n\n%s" % text.strip().splitlines()[-1]
+    if log is not None:
+        msg += "\n\n完整的錯誤記錄在：\n%s" % log
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(None, msg, "bili-trim", 0x10)
+    except Exception:
+        pass
+
+
+def main_frozen():
+    """exe 版：套件都封在裡面了，不用檢查也不用裝，直接開。"""
+    try:
+        import bili_gui
+        bili_gui.main()
+    except SystemExit:
+        raise
+    except Exception:
+        import traceback
+        _fatal(traceback.format_exc())
+        return 1
+    return 0
+
+
 def main():
+    if getattr(sys, "frozen", False):
+        return main_frozen()
     _console()
     if sys.version_info < MIN_PY:
         print("bili-trim 需要 Python %d.%d 以上，這個是 %d.%d.%d"

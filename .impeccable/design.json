@@ -1,0 +1,531 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-18T00:00:00Z",
+  "title": "Design System: bili-trim",
+  "extensions": {
+    "colorMeta": {
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "rgb(243, 242, 236)",
+        "tonalRamp": [
+          "#282824",
+          "#4A483D",
+          "#706B51",
+          "#9A9262",
+          "#B0AA86",
+          "#C2BFAE",
+          "#D9D8D2",
+          "#F3F3F2"
+        ]
+      },
+      "paper-shade": {
+        "role": "neutral",
+        "displayName": "Paper Shade",
+        "canonical": "rgb(231, 230, 221)",
+        "tonalRamp": [
+          "#282825",
+          "#48473F",
+          "#6C6A55",
+          "#938F68",
+          "#ABA88B",
+          "#C0BEB0",
+          "#D8D7D3",
+          "#F3F3F2"
+        ]
+      },
+      "paper-crease": {
+        "role": "neutral",
+        "displayName": "Paper Crease",
+        "canonical": "rgb(210, 209, 198)",
+        "tonalRamp": [
+          "#272725",
+          "#474640",
+          "#686759",
+          "#8C8A6F",
+          "#A6A490",
+          "#BDBCB3",
+          "#D7D7D3",
+          "#F3F3F2"
+        ]
+      },
+      "paper-selected": {
+        "role": "neutral",
+        "displayName": "Paper Selected",
+        "canonical": "rgb(221, 220, 209)",
+        "tonalRamp": [
+          "#282725",
+          "#48473F",
+          "#6B6956",
+          "#908D6B",
+          "#A9A68D",
+          "#BFBEB1",
+          "#D7D7D3",
+          "#F3F3F2"
+        ]
+      },
+      "grid-green": {
+        "role": "secondary",
+        "displayName": "Printed Grid Green",
+        "canonical": "rgb(95, 143, 108)",
+        "tonalRamp": [
+          "#242825",
+          "#3E4941",
+          "#536E5A",
+          "#659772",
+          "#88AE92",
+          "#AFC1B4",
+          "#D2D8D4",
+          "#F2F3F2"
+        ]
+      },
+      "grid-green-soft": {
+        "role": "secondary",
+        "displayName": "Soft Grid Green",
+        "canonical": "rgb(168, 196, 174)",
+        "tonalRamp": [
+          "#242825",
+          "#3E4940",
+          "#546D59",
+          "#669570",
+          "#89AD91",
+          "#AFC1B3",
+          "#D2D8D3",
+          "#F2F3F2"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "rgb(23, 20, 15)",
+        "tonalRamp": [
+          "#282724",
+          "#49453E",
+          "#6F6452",
+          "#988464",
+          "#AEA087",
+          "#C2BAAE",
+          "#D8D6D2",
+          "#F3F2F2"
+        ]
+      },
+      "ink-muted": {
+        "role": "neutral",
+        "displayName": "Muted Ink",
+        "canonical": "rgb(84, 84, 74)",
+        "tonalRamp": [
+          "#272726",
+          "#454542",
+          "#65655C",
+          "#858576",
+          "#A1A195",
+          "#BBBBB5",
+          "#D6D6D4",
+          "#F2F2F2"
+        ]
+      },
+      "ink-disabled": {
+        "role": "neutral",
+        "displayName": "Disabled Ink",
+        "canonical": "rgb(150, 148, 136)",
+        "tonalRamp": [
+          "#272726",
+          "#454542",
+          "#65645C",
+          "#858376",
+          "#A19F95",
+          "#BBBAB5",
+          "#D6D6D4",
+          "#F2F2F2"
+        ]
+      },
+      "vermilion": {
+        "role": "primary",
+        "displayName": "Vermilion (Cinnabar Seal Red)",
+        "canonical": "rgb(184, 35, 26)",
+        "tonalRamp": [
+          "#2D201F",
+          "#58312F",
+          "#93342E",
+          "#DB2B21",
+          "#E15D55",
+          "#DB9995",
+          "#E0CBCA",
+          "#F5F0F0"
+        ]
+      },
+      "vermilion-deep": {
+        "role": "primary",
+        "displayName": "Vermilion Deep",
+        "canonical": "rgb(150, 28, 20)",
+        "tonalRamp": [
+          "#2E201F",
+          "#59312E",
+          "#94332D",
+          "#DC2B1F",
+          "#E25C53",
+          "#DB9995",
+          "#E1CBCA",
+          "#F5F0F0"
+        ]
+      },
+      "vermilion-pale": {
+        "role": "primary",
+        "displayName": "Vermilion Pale",
+        "canonical": "rgb(242, 207, 201)",
+        "tonalRamp": [
+          "#2C2220",
+          "#543732",
+          "#8A4337",
+          "#C94832",
+          "#D47262",
+          "#D4A49C",
+          "#DECFCC",
+          "#F4F1F0"
+        ]
+      },
+      "ink-well": {
+        "role": "neutral",
+        "displayName": "Ink Well",
+        "canonical": "rgb(18, 16, 16)",
+        "tonalRamp": [
+          "#272626",
+          "#454242",
+          "#645D5D",
+          "#857676",
+          "#A09595",
+          "#BBB5B5",
+          "#D6D4D4",
+          "#F2F2F2"
+        ]
+      },
+      "on-well": {
+        "role": "neutral",
+        "displayName": "On Well",
+        "canonical": "rgb(217, 210, 196)",
+        "tonalRamp": [
+          "#282724",
+          "#49453D",
+          "#6F6552",
+          "#988763",
+          "#AFA287",
+          "#C2BBAE",
+          "#D8D6D2",
+          "#F3F2F2"
+        ]
+      },
+      "on-well-muted": {
+        "role": "neutral",
+        "displayName": "On Well Muted",
+        "canonical": "rgb(154, 145, 131)",
+        "tonalRamp": [
+          "#272625",
+          "#464441",
+          "#67625A",
+          "#8A8071",
+          "#A49D91",
+          "#BDB9B3",
+          "#D7D5D4",
+          "#F3F2F2"
+        ]
+      },
+      "status-ok": {
+        "role": "tertiary",
+        "displayName": "Status Green",
+        "canonical": "rgb(42, 115, 71)",
+        "tonalRamp": [
+          "#222B25",
+          "#375041",
+          "#41805A",
+          "#44B772",
+          "#6FC692",
+          "#A3CDB4",
+          "#CEDCD4",
+          "#F1F4F2"
+        ]
+      },
+      "warn-ochre": {
+        "role": "tertiary",
+        "displayName": "Ochre",
+        "canonical": "rgb(125, 95, 14)",
+        "tonalRamp": [
+          "#2E2A1F",
+          "#594E2D",
+          "#96792B",
+          "#E0AB1B",
+          "#E5BD50",
+          "#DDC993",
+          "#E1DBC9",
+          "#F5F3F0"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display (clock)",
+        "purpose": "The playback clock only."
+      },
+      "mark": {
+        "displayName": "Mark",
+        "purpose": "BILI-TRIM wordmark in the top bar."
+      },
+      "headline": {
+        "displayName": "Headline (serif)",
+        "purpose": "Section heads: 手機上的快取, 時間軸, 這一支."
+      },
+      "action": {
+        "displayName": "Action",
+        "purpose": "Label of the irreversible write action."
+      },
+      "title": {
+        "displayName": "Video Title (serif)",
+        "purpose": "Inspector title; falls back to body when the serif lacks a glyph."
+      },
+      "lead": {
+        "displayName": "Lead",
+        "purpose": "Text following the clock."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Body copy and buttons."
+      },
+      "body-strong": {
+        "displayName": "Body Strong",
+        "purpose": "Selected list titles, emphasis, missing-state marks."
+      },
+      "small": {
+        "displayName": "Small",
+        "purpose": "Captions, list second lines, messages, field labels."
+      },
+      "label-strong": {
+        "displayName": "Label Strong",
+        "purpose": "起 / 迄 marks and the 刪 glyph."
+      },
+      "numeral": {
+        "displayName": "Numeral",
+        "purpose": "Cut-list times and counts."
+      },
+      "numeral-small": {
+        "displayName": "Numeral Small",
+        "purpose": "Ruler ticks and strike labels."
+      },
+      "numeral-lead": {
+        "displayName": "Numeral Lead",
+        "purpose": "List durations, quality, sizes."
+      },
+      "numeral-value": {
+        "displayName": "Numeral Value",
+        "purpose": "Inspector values; 14 sits optically level with 17 CJK."
+      }
+    },
+    "platform": {
+      "kind": "native desktop (Python + Dear PyGui 2.3.1)",
+      "sourceOfTruth": "bili_look.py",
+      "units": "Logical px at the 標準 user font size, scaled by px() for DPI and the five-step user size. Dear PyGui font size is line height, not em.",
+      "constraints": [
+        "No letter-spacing.",
+        "No dashed borders.",
+        "One font per text item: merged fallback fonts and per-run baseline alignment from hhea metrics.",
+        "Child windows are at least 4px, so rules are 1x1 tinted images.",
+        "Text is offset by FramePadding.y; positioned-layout containers zero it (text_flush).",
+        "Tables pad rows unpredictably; the cut list is hand-positioned."
+      ]
+    },
+    "openDecisions": [
+      {
+        "name": "Numeral family",
+        "body": "Direction contract names Barlow Semi Condensed; build uses Bahnschrift SemiCondensed because Barlow would need downloading and bundling, not yet approved. User decides."
+      },
+      {
+        "name": "Light / dark",
+        "body": "Deferred by the user. Only the light paper theme exists; a second theme would swap the palette in bili_look.py."
+      }
+    ],
+    "shadows": [],
+    "motion": [],
+    "breakpoints": [
+      {
+        "name": "transport-split",
+        "value": "measured",
+        "purpose": "Transport row splits into two rows when buttons + segment + clock do not fit."
+      },
+      {
+        "name": "cut-list-compact",
+        "value": "time column < 112px",
+        "purpose": "Drop the 吸附挪動 column and tighten gaps."
+      },
+      {
+        "name": "inspector-pin",
+        "value": "measured",
+        "purpose": "Actions pin to the bottom only when the data overflows."
+      },
+      {
+        "name": "grid-thinning",
+        "value": "cell < 9px",
+        "purpose": "Draw every k-th fragment boundary and state 一格＝k 個 fragment."
+      },
+      {
+        "name": "strike-block",
+        "value": "width < 1.2 x hook height",
+        "purpose": "Strike collapses to a solid vermilion block."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Ink Button",
+      "kind": "button",
+      "refersTo": "button-ink",
+      "description": "Primary but reversible actions such as play and add.",
+      "html": "<button class=\"ds-btn-ink\">播放</button>",
+      "css": ".ds-btn-ink{background:#17140F;color:#F3F2EC;border:1px solid #17140F;border-radius:0;padding:6px 10px;font:700 17px/1.2 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;cursor:pointer}.ds-btn-ink:hover{background:#343029}.ds-btn-ink:active{background:#000}.ds-btn-ink:focus-visible{outline:1px solid #17140F;outline-offset:2px}.ds-btn-ink:disabled{background:#E7E6DD;color:#969488;border-color:#D2D1C6}"
+    },
+    {
+      "name": "Write Button",
+      "kind": "button",
+      "refersTo": "button-write",
+      "description": "Irreversible actions only: write to phone, restore to phone. The one filled red block on screen.",
+      "html": "<button class=\"ds-btn-write\">備份並寫入手機</button>",
+      "css": ".ds-btn-write{background:#B8231A;color:#fff;border:1px solid #B8231A;border-radius:0;padding:14px 10px;min-width:300px;font:700 20px/1.2 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;cursor:pointer}.ds-btn-write:hover{background:#961C14}.ds-btn-write:active{background:#7A1610}.ds-btn-write:focus-visible{outline:1px solid #17140F;outline-offset:2px}.ds-btn-write:disabled{background:#D2D1C6;color:#54544A;border-color:#D2D1C6}"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Secondary actions: transparent, muted-ink border.",
+      "html": "<button class=\"ds-btn-ghost\">看接縫</button>",
+      "css": ".ds-btn-ghost{background:transparent;color:#17140F;border:1px solid #54544A;border-radius:0;padding:6px 10px;font:400 17px/1.2 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;cursor:pointer}.ds-btn-ghost:hover{background:#E7E6DD}.ds-btn-ghost:active{background:#D2D1C6}.ds-btn-ghost:focus-visible{outline:1px solid #17140F;outline-offset:2px}.ds-btn-ghost:disabled{color:#969488;border-color:#D2D1C6}"
+    },
+    {
+      "name": "Segmented Toggle",
+      "kind": "custom",
+      "refersTo": "segment-on",
+      "description": "原片 / 成品 and 外擴 / 內縮: selected segment is ink with paper text.",
+      "html": "<div class=\"ds-seg\"><button class=\"ds-seg-on\">外擴</button><button class=\"ds-seg-off\">內縮</button></div>",
+      "css": ".ds-seg{display:inline-flex}.ds-seg button{border:1px solid #54544A;border-radius:0;padding:6px 18px;font:400 17px/1.2 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;cursor:pointer}.ds-seg-on{background:#17140F;color:#F3F2EC;font-weight:700!important}.ds-seg-off{background:transparent;color:#54544A;margin-left:-1px}.ds-seg-off:hover{background:#E7E6DD}.ds-seg button:focus-visible{outline:1px solid #17140F;outline-offset:2px}"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Cache list search: paper-shade field, crease border, square.",
+      "html": "<input class=\"ds-input-search\" placeholder=\"搜尋標題、作者或 cid…\">",
+      "css": ".ds-input-search{background:#E7E6DD;color:#17140F;border:1px solid #D2D1C6;border-radius:0;padding:7px 10px;font:400 16px/1.3 'Noto Sans TC', 'Microsoft JhengHei', sans-serif;width:280px}.ds-input-search::placeholder{color:#54544A}.ds-input-search:hover{background:#ECEBE3}.ds-input-search:focus-visible{background:#FAF9F5;outline:none;border-color:#54544A}"
+    },
+    {
+      "name": "Device Chip",
+      "kind": "chip",
+      "refersTo": "chip-device",
+      "description": "Top-bar device chip with a status square; the square is labelled, never colour alone.",
+      "html": "<span class=\"ds-chip\"><i></i>Pixel 7 · 1A2B3C4D</span>",
+      "css": ".ds-chip{display:inline-flex;align-items:center;gap:12px;background:#E7E6DD;color:#17140F;padding:8px 12px;font:400 16px/1 'Noto Sans TC', 'Microsoft JhengHei', sans-serif}.ds-chip i{width:9px;height:9px;background:#2A7347;display:inline-block}"
+    },
+    {
+      "name": "Cache List Row",
+      "kind": "card",
+      "refersTo": "library-row-selected",
+      "description": "Fixed furniture: two-line title, then duration, quality and size in tabular numerals. Unsupported rows are muted and say why.",
+      "html": "<div class=\"ds-row ds-row-sel\"><div class=\"ds-row-t\">【自用】深夜的城市散步 ASMR ｜ 雨聲 ♡ 兩小時</div><div class=\"ds-row-n\"><span>1:16:59</span><b>1080P60</b><span>287.4 MB</span></div></div><div class=\"ds-row ds-row-off\"><div class=\"ds-row-t\">山城的清晨市場</div><div class=\"ds-row-n\"><span>0:15:02</span><b>720P</b><span>54.0 MB</span></div><div class=\"ds-row-why\">不能剪：還沒下載完</div></div>",
+      "css": ".ds-row{width:298px;padding:10px 20px;border-bottom:1px solid #D2D1C6;background:#F3F2EC;color:#17140F;font:400 17px/1.5 'Noto Sans TC', 'Microsoft JhengHei', sans-serif}.ds-row-sel{background:#DDDCD1}.ds-row-sel .ds-row-t{font-weight:700}.ds-row:hover{background:#E7E6DD}.ds-row-n{display:flex;gap:14px;font:600 18px/1.4 'Barlow Semi Condensed', 'Bahnschrift', 'Microsoft JhengHei', sans-serif;font-variant-numeric:tabular-nums;color:#54544A}.ds-row-n b{color:#17140F}.ds-row-off,.ds-row-off .ds-row-n b{color:#54544A}.ds-row-why{font-size:16px;color:#54544A}"
+    },
+    {
+      "name": "Inspector Key-Value",
+      "kind": "custom",
+      "refersTo": "inspector",
+      "description": "Muted label left, numeral value right; 新長 and 移除 turn vermilion once there is a cut.",
+      "html": "<dl class=\"ds-kv\"><dt>原長</dt><dd>1:16:59</dd><dt>新長</dt><dd class=\"ds-cut\">1:14:59</dd><dt>移除</dt><dd class=\"ds-cut\">2 段 · 120.0 s</dd><dt>視訊</dt><dd>224,152,589</dd></dl>",
+      "css": ".ds-kv{display:grid;grid-template-columns:1fr auto;row-gap:12px;width:300px;padding:16px;margin:0;background:#E7E6DD;font:400 16px/1.3 'Noto Sans TC', 'Microsoft JhengHei', sans-serif}.ds-kv dt{color:#54544A}.ds-kv dd{margin:0;text-align:right;color:#17140F;font:400 17px/1.3 'Barlow Semi Condensed', 'Bahnschrift', 'Microsoft JhengHei', sans-serif;font-variant-numeric:tabular-nums}.ds-kv .ds-cut{color:#B8231A}"
+    },
+    {
+      "name": "Deletion Mark Timeline",
+      "kind": "custom",
+      "refersTo": "strike-cells",
+      "description": "Signature: 稿紙 grid, one cell per fragment; removed cells pale vermilion, a 3px vermilion strike with end hooks and a 刪 label on a paper knockout.",
+      "html": "<div class=\"ds-tl\"><div class=\"ds-tl-cut\"></div><div class=\"ds-tl-strike\"></div><span class=\"ds-tl-lab\"><b>刪</b> 55.0 s</span><div class=\"ds-tl-ph\"></div></div>",
+      "css": ".ds-tl{position:relative;width:520px;height:50px;background:#F3F2EC repeating-linear-gradient(90deg,transparent 0 47px,#A8C4AE 47px 48px);border:1px solid #5F8F6C}.ds-tl-cut{position:absolute;left:144px;width:240px;top:0;bottom:0;background:#F2CFC9}.ds-tl-strike{position:absolute;left:144px;width:240px;top:24px;height:3px;background:#B8231A}.ds-tl-strike::before,.ds-tl-strike::after{content:'';position:absolute;top:-9px;width:3px;height:21px;background:#B8231A}.ds-tl-strike::before{left:0}.ds-tl-strike::after{right:0}.ds-tl-strike:hover::before,.ds-tl-strike:hover::after{background:#17140F;width:6px}.ds-tl-ph{position:absolute;left:180px;top:0;bottom:0;width:2px;background:#17140F}.ds-tl-lab{position:absolute;left:226px;top:2px;z-index:1;background:#F3F2EC;padding:1px 5px;color:#B8231A;font:600 16px/1.1 'Barlow Semi Condensed', 'Bahnschrift', 'Microsoft JhengHei', sans-serif;font-variant-numeric:tabular-nums}.ds-tl-lab b{font-family:'Noto Sans TC', 'Microsoft JhengHei', sans-serif}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Proofreader's Sheet",
+    "overview": "The whole window is a sheet of Chinese proofreading paper laid on a desk: cool white stock, a printed green grid, and one vermilion pen that only ever marks deletions. This is not an editing suite. It refuses the NLE cockpit (dark grey, orange accent, many tracks) and the light SaaS dashboard (rounded cards, soft shadows). Cutting a sponsor segment reads as striking a passage from a manuscript: the document stays the same document, a passage is marked out, and the margin note says how much is gone.\n\nThe video frame sits in an ink well, a black field with a dark border, so the eye's local surround stays dark while the rest of the desk stays paper. Density is that of a working document: three fixed columns (cache list, sheet, \"this one\" inspector), quiet hairlines, and numerals set in a condensed tabular face so running clocks never jitter. Every surface is flat; structure comes from tone (paper, shade, crease) and 1px lines, never from lift.\n\nThe system lives in one file, `bili_look.py`. Colours, the type scale, font roles and every theme are defined there; `bili_gui.py` only references them. Only the light paper theme exists. A dark theme is a deferred, open decision; if it comes, it swaps the palette in that file and nothing else.",
+    "keyCharacteristics": [
+      "Paper-toned flat surfaces; depth by tone and hairline only.",
+      "One accent, vermilion, with exactly two meanings: will be removed, and irreversible.",
+      "The 刪除號 (deletion mark) on the 稿紙 grid timeline is the signature.",
+      "Serif headings, sans body, condensed tabular numerals for every time and byte count.",
+      "Zero radius, zero shadow, zero gradient.",
+      "Everything scales with the five-step user font size through `px()`; layout reflows rather than just enlarging text."
+    ],
+    "rules": [
+      {
+        "name": "The Two Meanings Rule",
+        "body": "Vermilion means \"this will be removed\" or \"this cannot be undone\". Nothing else is red: not errors, not warnings, not links, not focus. A missing dependency is shown in ink plus bold; a caution is ochre. Every extra red dilutes the deletion mark.",
+        "section": "colors"
+      },
+      {
+        "name": "The One Red Block Rule",
+        "body": "In the main window the only filled vermilion block is the write action in the inspector. Other vermilion is line, text or tint.",
+        "section": "colors"
+      },
+      {
+        "name": "The Not By Colour Alone Rule",
+        "body": "Every coloured state also carries text or shape: the strike has hooks and a 「刪」 label, the status square has a label, unsupported rows say why.",
+        "section": "colors"
+      },
+      {
+        "name": "The Steady Clock Rule",
+        "body": "Every number that changes while playing or that is compared in a column (times, bytes, counts) is set in the tabular numeral face. Proportional digits are a defect.",
+        "section": "typography"
+      },
+      {
+        "name": "The Mixed-Run Rule",
+        "body": "A Dear PyGui text item has one font, so mixed CJK and numeral runs are separate items aligned on a shared baseline computed from each font's hhea metrics. Do not fake alignment with manual nudges.",
+        "section": "typography"
+      },
+      {
+        "name": "Open: the numeral family",
+        "body": "The direction contract names Barlow Semi Condensed for numerals. The build uses Bahnschrift SemiCondensed because Barlow would have to be downloaded and bundled, which has not been approved. This is unresolved; the user will decide. Do not swap it either way without that decision.",
+        "section": "typography"
+      },
+      {
+        "name": "The Scale Everything Rule",
+        "body": "Every dimension goes through `px()` and the theme is rebuilt on a font-size change; the timeline geometry is recomputed too. A hard-coded physical pixel is a bug, except deliberate 1px hairlines.",
+        "section": "layout"
+      },
+      {
+        "name": "The Paper Has No Shadows Rule",
+        "body": "Nothing floats. If an element needs separation, use a tone step or a 1px line.",
+        "section": "elevation"
+      },
+      {
+        "name": "The Snapped Truth Rule",
+        "body": "Every number about a cut is the snapped value, the one that will actually be removed: strike label, cut list 起 / 迄 / 實際刪, inspector, confirm dialog. Never show the requested value where the removed value belongs. Durations use `fmt_dur`, which rounds to the second, so 原長 minus 移除 equals 新長.",
+        "section": "components"
+      },
+      {
+        "name": "The Flush Text Rule",
+        "body": "Dear PyGui pushes text down by FramePadding.y. Containers whose children are positioned by coordinate (bar, list pane, footer, key-value, cut list, log) zero it, so a coordinate is where the glyph actually sits.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "**Do** keep every colour, size, font role and theme in `bili_look.py`; a future dark theme swaps that palette only.",
+      "**Do** use vermilion only for what will be removed and for irreversible actions (寫入手機, 還原到手機, 備份並寫入).",
+      "**Do** show warnings in ochre and missing or failed states in ink plus bold.",
+      "**Do** set every time, byte count and count in the tabular numeral face.",
+      "**Do** show snapped, actually-removed values everywhere and round durations with `fmt_dur`.",
+      "**Do** draw cut points on fragment grid lines and state the grid unit (一格＝k 個 fragment) whenever k > 1.",
+      "**Do** pass every dimension through `px()` and verify at the largest user font size.",
+      "**Do** draw hairlines as 1x1 tinted images or half-pixel lines."
+    ],
+    "donts": [
+      "**Don't** use vermilion for errors, warnings, links, focus or decoration.",
+      "**Don't** round a corner, cast a shadow or use a gradient.",
+      "**Don't** use dashed borders or rely on letter-spacing; Dear PyGui has neither.",
+      "**Don't** use proportional digits for anything that ticks or is compared in a column.",
+      "**Don't** put the video frame on paper; it lives in the ink well.",
+      "**Don't** swap Bahnschrift for Barlow Semi Condensed, or the reverse, until the user decides.",
+      "**Don't** add a second theme until the light / dark decision is made."
+    ]
+  }
+}

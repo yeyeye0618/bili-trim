@@ -24,6 +24,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -41,6 +42,7 @@ import bili_config as CFG
 import bili_device as DEV
 import bili_env as ENV
 import bili_font as BF
+import bili_look as LOOK
 import bili_media as MED
 import bili_trim as TRIM
 
@@ -59,6 +61,9 @@ APP_NAME = "B站 緩存去工商"
 WINDOW_TITLE = "bili-trim"
 
 HERE = Path(__file__).resolve().parent
+
+# 視窗標題列與工作列的圖示（exe 版封在 exe 裡，執行時解到 sys._MEIPASS）
+ICON_PATH = Path(getattr(sys, "_MEIPASS", HERE)) / "assets" / "bili-trim.ico"
 
 
 # --------------------------------------------------------------------------- #
@@ -174,29 +179,6 @@ def _dpg_major():
         return 2
 
 
-def pick_font(size=17):
-    """回傳 (font_tag, 路徑)；找不到中文字型就回 (None, None)。"""
-    # Dear PyGui 2.x 會按需載入字符，range hint 已經是 no-op（而且它的棄用警告
-    # 自己動了 warnings 的 filter，壓不掉），所以只有 1.x 才需要給。
-    need_hints = _dpg_major() < 2
-    for path in FONT_CANDIDATES:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with dpg.font_registry():
-                with dpg.font(path, size) as f:
-                    if need_hints:
-                        for hint in ("mvFontRangeHint_Chinese_Full",
-                                     "mvFontRangeHint_Japanese",
-                                     "mvFontRangeHint_Default"):
-                            if hasattr(dpg, hint):
-                                dpg.add_font_range_hint(getattr(dpg, hint))
-            return f, path
-        except Exception:
-            continue
-    return None, None
-
-
 # --------------------------------------------------------------------------- #
 # 小工具
 # --------------------------------------------------------------------------- #
@@ -246,17 +228,58 @@ def complement(segments, lo, hi):
     return out
 
 
-# 顏色
-C_KEEP = (62, 134, 96, 255)
-C_KEEP_HL = (84, 178, 126, 255)
-C_CUT = (176, 58, 58, 255)
-C_CUT_EDGE = (235, 110, 110, 255)
-C_ASK = (226, 196, 86, 255)
-C_BAR_BG = (46, 48, 54, 255)
-C_FRAG = (104, 112, 128, 255)
-C_RULER = (150, 156, 168, 255)
-C_PLAY = (245, 245, 245, 255)
-C_MARK = (90, 196, 220, 255)
+def fmt_clock(t):
+    """播放位置的大字：一律兩位數，數字寬度才不會跳。"""
+    t = max(float(t), 0.0)
+    return "%02d:%02d:%02d" % (int(t // 3600), int((t % 3600) // 60), int(t % 60))
+
+
+def fmt_dur(t):
+    """影片長度：四捨五入到秒。原長、新長、移除的秒數才對得起來（不要一個取整一個截斷）。"""
+    return fmt_time(round(float(t)))
+
+
+def fmt_delta(d):
+    """吸附挪了多少秒：0 就寫 0，不要出現 -0.0。"""
+    if abs(d) < 0.05:
+        return "0"
+    return "%+.1f" % d
+
+
+def fmt_ruler(t):
+    t = int(round(t))
+    if t >= 3600:
+        return "%d:%02d:%02d" % (t // 3600, (t % 3600) // 60, t % 60)
+    return "%d:%02d" % (t // 60, t % 60)
+
+
+def short_path(p, keep=2):
+    """C:\\Users\\x\\Documents\\bili_backups -> Documents\\bili_backups"""
+    parts = Path(p).parts
+    if len(parts) <= keep + 1:
+        return str(p)
+    return os.sep.join(parts[-keep:])
+
+
+def crisp(v):
+    """1 px 的線要落在像素中間，不然會糊成兩條半透明的線。"""
+    return int(v) + 0.5
+
+
+_ASCII_RUN = re.compile(r"[\x00-\x7f]+|[^\x00-\x7f]+")
+_WRAP_TOKEN = re.compile(r"[A-Za-z0-9_.,:;!?'\"()\[\]/%+\-@#&*=~]+|\s|.")
+
+
+# 版面尺寸（邏輯像素，以「標準」字級為準；實際大小一律過 px()）
+LIB_W = 298        # 左：快取清單
+INSP_W = 324       # 右：這一支
+BAR_H = 48         # 頂列
+FOOT_H = 30        # 底列
+
+# 時間軸的尺度：一格要多寬才看得出是一格
+CELL_MIN = 9
+RULER_MINOR = {1: 5, 2: 4, 5: 5, 10: 5, 15: 3, 30: 3, 60: 4, 120: 4, 300: 5,
+               600: 5, 900: 3, 1800: 3, 3600: 4, 7200: 4}
 
 
 # --------------------------------------------------------------------------- #
@@ -270,21 +293,41 @@ class App(object):
         時間軸的幾何（實體像素）。DPI 與字級都會影響，所以換字級重建介面時
         要重算一次 —— 不重算的話時間軸會維持舊尺寸，字變大就擠在一起。
         """
-        self.TL_H_RULER = px(18)
-        self.TL_H_BAR = px(46)
-        self.TL_H_FRAG = px(17)   # 要放得下「放大才看得到切點邊界」那行字
-        self.TL_PAD = px(3)
-        self.EDGE_GRAB = px(7)    # 抓邊緣的像素容忍度
+        # 時間軸由上而下：刻度、稿紙格（一格一個 fragment）、標記帶、說明列
+        self.TL_RULER = px(28)
+        self.TL_CELLS = px(50)
+        self.TL_BAND = px(26)
+        self.TL_FOOT = px(22)
+        self.TL_H = self.TL_RULER + self.TL_CELLS + self.TL_BAND + self.TL_FOOT
+        self.EDGE_GRAB = px(7)    # 抓刪除號兩端的像素容忍度
+        self.ROW_H_HEAD = px(30)
+        self.ROW_H = px(36)
+        # 區間表固定高度：表頭 + 三列（兩段 + 草稿列，再多就捲動）
+        self.CUTS_H = self.ROW_H_HEAD + 4 * (self.ROW_H + 1) + 2
+        self._cuts_compact = False
 
     def __init__(self):
         self._compute_metrics()
         self.cfg = load_config()
         self.log_lines = []
-        self.base_font_path = None
-        self.merged_font_path = None
+        self.font_paths = {}
+        self.font_files = {}
+        self.F = {}               # 字型角色 -> Dear PyGui 的 font id
+        self.T = {}               # 主題名稱 -> theme id
         self._font_regs = []
-        self._adb_label = "檢查中…"
-        self._adb_color = (170, 176, 188, 255)
+        self._wcache = {}
+        self._aligns = []
+        self._hrules = []
+        self._vrules = []
+        self._segs = {}
+        self._later = []
+        self._hover = None
+        self._foot_text = ""
+        self._grid_k = 1
+        self._native = (0, 0)
+        self._adb_label = "adb 檢查中…"
+        self._ff_label = ""
+        self._stage_note = ""
         self.ui_q = queue.Queue()
         self.busy = False
         self.busy_name = ""
@@ -319,6 +362,7 @@ class App(object):
         self.show_w = 0           # 畫面上實際顯示的大小（照編輯區寬度縮）
         self.show_h = 0
         self._last_frame = None   # 重建貼圖時用來把畫面補回去
+        self._fit_key = None
 
         # 時間軸視窗
         self.view_a = 0.0
@@ -362,19 +406,34 @@ class App(object):
         else:
             self.post(lambda: self._emit_log(stamped))
 
-    @staticmethod
-    def _emit_log(stamped):
+    def _emit_log(self, stamped):
         if not dpg.does_item_exist("log_area"):
             return
+        loud = ("失敗" in stamped or "出錯" in stamped or "警告" in stamped
+                or "不符" in stamped)
         for i, line in enumerate(stamped.splitlines() or [""]):
-            dpg.add_text(line if i == 0 else ("         " + line),
-                         parent="log_area", wrap=0)
+            t = dpg.add_text(line if i == 0 else ("    " + line),
+                             parent="log_area", wrap=0,
+                             color=LOOK.INK if loud else LOOK.INK_2)
+            self.font(t, self.role_for(line, "strong_s") if loud else "small")
         dpg.set_y_scroll("log_area", -1.0)
+        if dpg.does_item_exist("last_msg"):
+            first = stamped.split("] ", 1)[-1].splitlines()[0] if stamped else ""
+            line = self.wrap(first, "small", px(560), 1)[0]
+            dpg.set_value("last_msg", line)
+            dpg.configure_item("last_msg",
+                               color=LOOK.INK if loud else LOOK.INK_2)
 
     def progress(self, frac, text=""):
         def do():
+            if not dpg.does_item_exist("prog"):
+                return
             dpg.set_value("prog", max(0.0, min(1.0, frac)))
-            dpg.configure_item("prog", overlay=text)
+            dpg.set_value("prog_label", text)
+            busy = bool(text) or frac > 0
+            dpg.configure_item("prog", show=busy)
+            dpg.configure_item("prog_label", show=busy)
+            dpg.configure_item("last_msg", show=not busy)
         self.post(do)
 
     def _mk_progress(self, prefix=""):
@@ -407,6 +466,7 @@ class App(object):
             except Exception as e:
                 tb = traceback.format_exc()
                 self.log("【%s】失敗：%s" % (name, e))
+                self.post(self.show_log)      # 失敗一定要讓人看到整段說明
                 if not isinstance(e, (DEV.AdbError, BK.BackupError,
                                       MED.MediaError, ValueError)):
                     self.log(tb)
@@ -422,182 +482,630 @@ class App(object):
         threading.Thread(target=body, name=name, daemon=True).start()
         return True
 
+    # ---- 小工具：字型、量字、對齊、線 ----
+
+    def font(self, item, role):
+        f = self.F.get(role)
+        if f is not None and item:
+            dpg.bind_item_font(item, f)
+        return item
+
+    def theme(self, item, name):
+        t = self.T.get(name)
+        if t is not None and item:
+            dpg.bind_item_theme(item, t)
+        return item
+
+    # 粗體、襯線、數字字型都沒補字：遇到它畫不出來的字就退回補過字的內文
+    PLAIN_ROLE = {"strong": "body", "strong_s": "small", "action": "body",
+                  "title": "body", "head": "body", "num": "body",
+                  "num_s": "small", "num_l": "lead", "num_v": "body",
+                  "clock": "body",
+                  "mark": "body"}
+
+    def role_for(self, text, role):
+        if role not in self.PLAIN_ROLE:
+            return role
+        face = LOOK.FONT_ROLES[role][0]
+        path = self.font_files.get(face)
+        if path is None or path == self.font_files.get("body"):
+            return role
+        if BF.covers(path, text):
+            return role
+        return self.PLAIN_ROLE[role]
+
+    def _exact_width(self, text, role):
+        f = self.F.get(role)
+        try:
+            sz = dpg.get_text_size(text, font=f) if f else dpg.get_text_size(text)
+        except Exception:
+            return None
+        if sz and sz[0] > 0:
+            return float(sz[0])
+        return None
+
+    def measure(self, text, role="body"):
+        """文字寬度（實體像素）。字型還沒載好時用估的，寧可估寬一點。"""
+        if not text:
+            return 0.0
+        w = self._exact_width(text, role)
+        if w is not None:
+            return w
+        size = px(LOOK.SIZES[LOOK.FONT_ROLES[role][1]])
+        return sum(size * (0.86 if ord(c) > 0x2E7F else 0.56) for c in text)
+
+    def wrap(self, text, role, width, max_lines):
+        """手動斷行（中文可以任意斷），超過行數就在最後一行補「…」。"""
+        cache = self._wcache.setdefault(role, {})
+
+        def cw(ch):
+            w = cache.get(ch)
+            if w is None:
+                w = self._exact_width(ch, role)
+                if w is None:
+                    return self.measure(ch, role)
+                cache[ch] = w
+            return w
+
+        # 英數字串當成一個詞（不要把 bytes 斷成 byt / es），中文一個字一個單位
+        tokens = []
+        for tok in _WRAP_TOKEN.findall(text):
+            if len(tok) > 1 and sum(cw(c) for c in tok) > width:
+                tokens.extend(tok)        # 一個詞比整行還長，只好逐字斷
+            else:
+                tokens.append(tok)
+        lines, cur, cur_w, i, n = [], "", 0.0, 0, len(tokens)
+        while i < n:
+            tok = tokens[i]
+            w = sum(cw(c) for c in tok)
+            if cur and cur_w + w > width:
+                lines.append(cur.rstrip())
+                cur, cur_w = "", 0.0
+                if len(lines) == max_lines:
+                    break
+                if tok.isspace():
+                    i += 1
+                    continue
+            cur += tok
+            cur_w += w
+            i += 1
+        if cur and len(lines) < max_lines:
+            lines.append(cur)
+        if i < n and lines:
+            last, ell = lines[-1], "…"
+            while last and sum(cw(c) for c in last) + cw(ell) > width:
+                last = last[:-1]
+            lines[-1] = last.rstrip() + ell
+        return lines or [""]
+
+    def later(self, fn, frames=2):
+        """過幾個畫格再做 —— 剛載入的字型要畫過一次才量得到寬度。"""
+        self._later.append([frames, fn])
+
+    def _tick_later(self):
+        if not self._later:
+            return
+        due = [item for item in self._later if item[0] <= 0]
+        for item in self._later:
+            item[0] -= 1
+        self._later = [item for item in self._later if item[0] >= 0]
+        for _, fn in due:
+            try:
+                fn()
+            except Exception:
+                self.log("UI 回呼出錯：\n%s" % traceback.format_exc())
+
+    def align_right(self, spacer, block, container, pad, gap):
+        """讓 block 貼齊 container 的右邊：每一格調一次中間 spacer 的寬度。"""
+        self._aligns.append((spacer, block, container, pad, gap))
+
+    def _tick_aligns(self):
+        # spacer 自己沒有矩形可以問，所以看 block 的右緣差多少，就把 spacer 加寬多少
+        for spacer, block, container, pad, gap in self._aligns:
+            try:
+                # 子視窗沒有 rect_min/max 可問，只有位置（在最外層視窗裡，
+                # 也就是螢幕座標）和大小
+                right = (dpg.get_item_state(container)["pos"][0]
+                         + dpg.get_item_rect_size(container)[0] - pad)
+                bx = dpg.get_item_rect_max(block)[0]
+                bw = dpg.get_item_rect_size(block)[0]
+                cur = dpg.get_item_configuration(spacer)["width"]
+            except Exception:
+                continue
+            if bw <= 0:
+                continue
+            w = max(int(cur + right - bx), 1)
+            if abs(w - cur) >= 1:
+                dpg.configure_item(spacer, width=w)
+
+    def hrule(self, color, h, width=None, parent=0, track=True, pos=None):
+        """水平線。用一張 1x1 白圖染色畫：Dear PyGui 的子視窗最矮 4 px。"""
+        kw = {"parent": parent} if parent else {}
+        if pos is not None:
+            kw["pos"] = pos
+        t = dpg.add_image("tex_white", width=width or px(1600), height=max(h, 1),
+                          tint_color=color, **kw)
+        if width is None and track:
+            self._hrules.append(t)
+        return t
+
+    def vrule(self, color=LOOK.PAPER_3):
+        t = dpg.add_image("tex_white", width=1, height=px(400), tint_color=color)
+        self._vrules.append(t)
+        return t
+
+    def seg(self, key, labels, value, callback, width=0, height=0):
+        """兩段式切換鈕（原片／成品、外擴／內縮）。選中的是墨底白字。"""
+        tags = []
+        with dpg.group(horizontal=True, horizontal_spacing=0):
+            for i, lab in enumerate(labels):
+                tag = "seg_%s_%d" % (key, i)
+                dpg.add_button(label=lab, tag=tag, width=width, height=height,
+                               user_data=(key, lab), callback=self._on_seg)
+                tags.append(tag)
+        self._segs[key] = {"tags": tags, "labels": labels, "value": value,
+                           "cb": callback}
+        self._paint_seg(key)
+
+    def _paint_seg(self, key):
+        s = self._segs.get(key)
+        if not s:
+            return
+        for tag, lab in zip(s["tags"], s["labels"]):
+            if dpg.does_item_exist(tag):
+                on = lab == s["value"]
+                self.theme(tag, "seg_on" if on else "seg_off")
+                self.font(tag, "strong" if on else "body")
+
+    def _on_seg(self, sender, app_data, user_data):
+        key, lab = user_data
+        s = self._segs.get(key)
+        if not s or lab == s["value"]:
+            return
+        s["value"] = lab
+        self._paint_seg(key)
+        s["cb"](lab)
+
+    def set_seg(self, key, lab):
+        if key in self._segs:
+            self._segs[key]["value"] = lab
+            self._paint_seg(key)
+
+    @staticmethod
+    def _reserve():
+        """主體三欄底下要留給底列的高度（含那條 2 px 的黑線）。"""
+        return px(FOOT_H) + max(px(2), 1)
+
     # ======================================================================= #
     # 介面
     # ======================================================================= #
 
     def build(self):
         dpg.add_texture_registry(tag="tex_reg")
-        with dpg.window(tag="root"):
-            self._build_menu()
-            self._build_toolbar()
-            with dpg.group(horizontal=True):
+        self._aligns, self._hrules, self._vrules = [], [], []
+        with dpg.window(tag="root", no_scrollbar=True):
+            self._build_topbar()
+            self.hrule(LOOK.INK, max(px(2), 1))
+            with dpg.group(horizontal=True, horizontal_spacing=0):
                 self._build_library()
+                self.vrule()
                 self._build_editor()
-            self._build_bottom()
+                self.vrule()
+                self._build_inspector()
+            self.hrule(LOOK.INK, max(px(2), 1))
+            self._build_footer()
+        self.theme("root", "root")
+        self._build_popups()
         self._build_dialogs()
         dpg.set_primary_window("root", True)
 
-    def _build_menu(self):
-        with dpg.menu_bar():
-            with dpg.menu(label="緩存"):
-                dpg.add_menu_item(label="重新掃描裝置與緩存",
-                                  callback=lambda: self.refresh_all())
-                dpg.add_menu_item(label="重新從手機拉取這支（放棄本機暫存）",
-                                  callback=lambda: self.on_load_clicked(True))
-            with dpg.menu(label="備份"):
-                dpg.add_menu_item(label="還原備份…",
-                                  callback=self.show_restore_window)
-                dpg.add_menu_item(label="變更備份位置…",
-                                  callback=lambda: dpg.show_item("dlg_backup_dir"))
-                dpg.add_menu_item(label="開啟備份資料夾",
-                                  callback=self.open_backup_dir)
-            with dpg.menu(label="設定"):
-                dpg.add_slider_int(label="音量", default_value=self.cfg["volume"],
-                                   min_value=0, max_value=100, width=px(160),
-                                   callback=self.on_volume)
-                dpg.add_slider_int(label="音訊延遲 (ms)", width=px(160),
-                                   default_value=self.cfg["audio_offset_ms"],
-                                   min_value=-800, max_value=800,
-                                   callback=self.on_audio_offset)
-                dpg.add_checkbox(label="寫入後自動關閉 B站 App",
-                                 default_value=self.cfg["force_stop_after_write"],
-                                 callback=self.on_force_stop_toggle)
-                dpg.add_combo(("原生解析度", "最高 1080p", "最高 720p",
-                               "最高 480p"), label="預覽畫質", width=px(150),
-                              default_value=self.cfg["preview_quality"],
-                              callback=self.on_preview_quality)
-                dpg.add_combo([n for n, _ in FONT_SIZES], label="介面字級",
-                              width=px(150), tag="font_combo",
-                              default_value=font_label_of(self.cfg["font_pt"]),
-                              callback=self.on_font_size)
-            with dpg.menu(label="說明"):
-                dpg.add_menu_item(label="這個工具的限制",
-                                  callback=lambda: dpg.show_item("win_help"))
-                dpg.add_menu_item(label="環境檢查",
-                                  callback=self.show_env_window)
+    # ---- 頂列：裝訂邊 ----
 
-    def _build_toolbar(self):
-        with dpg.group(horizontal=True):
-            dpg.add_text("adb:")
-            dpg.add_text("檢查中…", tag="adb_state")
-            dpg.add_spacer(width=px(12))
-            dpg.add_text("裝置:")
-            dpg.add_combo([], tag="device_combo", width=px(240),
-                          callback=self.on_device_pick)
-            dpg.add_button(label="重新掃描", callback=lambda: self.refresh_all())
-            dpg.add_spacer(width=px(12))
-            dpg.add_text("備份位置:")
-            dpg.add_text("", tag="backup_dir_label")
-            dpg.add_button(label="變更",
-                           callback=lambda: dpg.show_item("dlg_backup_dir"))
+    def _build_topbar(self):
+        with dpg.child_window(tag="topbar", height=px(BAR_H), border=False,
+                              no_scrollbar=True, always_use_window_padding=True):
+            with dpg.group(horizontal=True, horizontal_spacing=px(12)):
+                with dpg.group() as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(3))
+                    self.font(dpg.add_text("BILI-TRIM"), "mark")
+                with dpg.group() as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(11))
+                    self.font(dpg.add_text("v%s" % ENV.VERSION,
+                                           color=LOOK.INK_2), "num_s")
+                dpg.add_spacer(width=px(6))
+                with dpg.group(horizontal=True, horizontal_spacing=0):
+                    dpg.add_drawlist(width=px(24), height=px(32), tag="chip_dot")
+                    self.theme(dpg.add_button(label="沒有連線的手機", tag="chip_dev",
+                                              height=px(32)), "chip")
+                with dpg.group() as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(8))
+                    self.font(dpg.add_text("", tag="roots_label",
+                                           color=LOOK.INK_2), "small")
+                dpg.add_spacer(width=10, tag="bar_sp")
+                with dpg.group(horizontal=True, horizontal_spacing=px(2),
+                               tag="bar_right"):
+                    for tag, label in (("bar_backup", "備份"),
+                                       ("bar_settings", "設定"),
+                                       ("bar_help", "說明")):
+                        b = dpg.add_button(label=label, tag=tag, height=px(32))
+                        self.theme(b, "flat")
+        self.align_right("bar_sp", "bar_right", "topbar", px(20) - px(8),
+                         px(12))
+        self.theme("topbar", "bar")
+
+    def _draw_chip_dot(self):
+        if not dpg.does_item_exist("chip_dot"):
+            return
+        dpg.delete_item("chip_dot", children_only=True)
+        w, h = px(24), px(32)
+        dpg.draw_rectangle((0, 0), (w, h), fill=LOOK.PAPER_2, color=LOOK.PAPER_2,
+                           parent="chip_dot")
+        s = px(7)
+        x0, y0 = px(12) - s / 2.0, h / 2.0 - s / 2.0
+        on = self.device is not None
+        dpg.draw_rectangle((x0, y0), (x0 + s, y0 + s),
+                           fill=LOOK.OK if on else LOOK.PAPER_2,
+                           color=LOOK.OK if on else LOOK.INK_2,
+                           parent="chip_dot")
+
+    def _sync_device_ui(self):
+        """頂列的裝置晶片、快取來源，和裝置選單。"""
+        dev = self.device
+        if dpg.does_item_exist("chip_dev"):
+            if dev is None:
+                label = "沒有連線的手機"
+            else:
+                label = ("%s · %s" % (dev.model, dev.serial) if dev.model
+                         else dev.serial)
+            dpg.set_item_label("chip_dev", label)
+        if dpg.does_item_exist("roots_label"):
+            if self.roots:
+                dpg.set_value("roots_label", "%s · %d 支" % (
+                    "、".join(r.label for r in self.roots), len(self.items)))
+            else:
+                dpg.set_value("roots_label", "")
+        self._draw_chip_dot()
+        if dpg.does_item_exist("pop_dev_list"):
+            dpg.delete_item("pop_dev_list", children_only=True)
+            for n, d in enumerate(self.devices):
+                dpg.add_menu_item(label=d.label, parent="pop_dev_list",
+                                  check=True, default_value=d is dev,
+                                  user_data=n, callback=self.on_device_pick)
+            if not self.devices:
+                self.font(dpg.add_text("adb 看不到裝置。接上 USB、開啟「USB 偵錯」，"
+                                       "並在手機上允許這台電腦。",
+                                       parent="pop_dev_list", wrap=px(300),
+                                       color=LOOK.INK_2), "small")
+
+    def _build_popups(self):
+        """頂列的四個選單。點一下就開，不是右鍵。"""
+        left = dpg.mvMouseButton_Left
+        with dpg.popup("chip_dev", mousebutton=left, tag="pop_dev",
+                       min_size=(px(280), px(20))):
+            dpg.add_group(tag="pop_dev_list")
+            dpg.add_separator()
+            dpg.add_menu_item(label="重新掃描裝置與快取",
+                              callback=lambda: self.refresh_all())
+        with dpg.popup("bar_backup", mousebutton=left, tag="pop_backup",
+                       min_size=(px(280), px(20))):
+            self.font(dpg.add_text("", tag="backup_dir_label", wrap=px(320),
+                                   color=LOOK.INK_2), "small")
+            dpg.add_separator()
+            dpg.add_menu_item(label="還原備份…", callback=self.show_restore_window)
+            dpg.add_menu_item(label="開啟備份資料夾", callback=self.open_backup_dir)
+            dpg.add_menu_item(label="變更備份位置…",
+                              callback=lambda: dpg.show_item("dlg_backup_dir"))
+        with dpg.popup("bar_settings", mousebutton=left, tag="pop_settings",
+                       min_size=(px(300), px(20))):
+            dpg.add_slider_int(label="音量", default_value=self.cfg["volume"],
+                               min_value=0, max_value=100, width=px(170),
+                               callback=self.on_volume)
+            dpg.add_slider_int(label="音訊延遲 (ms)", width=px(170),
+                               default_value=self.cfg["audio_offset_ms"],
+                               min_value=-800, max_value=800,
+                               callback=self.on_audio_offset)
+            dpg.add_combo(("原生解析度", "最高 1080p", "最高 720p", "最高 480p"),
+                          label="預覽畫質", width=px(170),
+                          default_value=self.cfg["preview_quality"],
+                          callback=self.on_preview_quality)
+            dpg.add_combo([n for n, _ in FONT_SIZES], label="介面字級",
+                          width=px(170), tag="font_combo",
+                          default_value=font_label_of(self.cfg["font_pt"]),
+                          callback=self.on_font_size)
+            dpg.add_checkbox(label="寫入後自動關閉 B站 App",
+                             default_value=self.cfg["force_stop_after_write"],
+                             callback=self.on_force_stop_toggle)
+        with dpg.popup("bar_help", mousebutton=left, tag="pop_help",
+                       min_size=(px(220), px(20))):
+            dpg.add_menu_item(label="這個工具的限制",
+                              callback=lambda: (self.center_window("win_help"),
+                                                dpg.show_item("win_help")))
+            dpg.add_menu_item(label="環境檢查", callback=self.show_env_window)
+        self._sync_device_ui()
+        self._sync_backup_label()
+
+    def _sync_backup_label(self):
+        d = self.cfg["backup_dir"]
+        if dpg.does_item_exist("bar_backup"):
+            dpg.set_item_label("bar_backup", "備份 → %s" % short_path(d))
+        if dpg.does_item_exist("backup_dir_label"):
+            dpg.set_value("backup_dir_label", "寫入前的原檔都收在：\n%s" % d)
+
+    # ---- 左：手機上的快取 ----
 
     def _build_library(self):
-        with dpg.child_window(width=px(430), height=px(-128), tag="lib_pane"):
-            dpg.add_text("手機上的緩存")
-            dpg.add_input_text(tag="lib_filter", width=-1, hint="搜尋標題…",
-                               callback=self.rebuild_library)
-            with dpg.child_window(height=px(-150), tag="lib_list"):
-                dpg.add_text("先連好手機，按「重新掃描」。", tag="lib_empty")
-            dpg.add_separator()
-            dpg.add_text("", tag="sel_title", wrap=px(400))
-            dpg.add_text("", tag="sel_meta", wrap=px(400))
-            dpg.add_text("", tag="sel_state", wrap=px(400))
-            dpg.add_button(label="載入以編輯", tag="btn_load", width=-1,
-                           callback=lambda: self.on_load_clicked(False))
+        W = px(LIB_W)
+        with dpg.child_window(tag="lib_pane", width=W, height=-self._reserve(),
+                              border=False, no_scrollbar=True):
+            dpg.add_spacer(height=px(13))
+            with dpg.group(horizontal=True, horizontal_spacing=0, indent=px(16)):
+                self.font(dpg.add_text("手機上的快取"), "head")
+                dpg.add_spacer(width=10, tag="lib_count_sp")
+                with dpg.group(tag="lib_count_grp"):
+                    dpg.add_spacer(height=px(5))
+                    self.font(dpg.add_text("", tag="lib_count",
+                                           color=LOOK.INK_2), "num_l")
+            dpg.add_spacer(height=px(12))
+            f = dpg.add_input_text(tag="lib_filter", width=W - px(32),
+                                   indent=px(16), hint="搜尋標題、作者或 cid…",
+                                   callback=self.rebuild_library)
+            self.theme(f, "search")
+            dpg.add_spacer(height=px(10))
+            self.hrule(LOOK.PAPER_3, 1, width=W)
+            with dpg.child_window(tag="lib_list", border=False,
+                                  height=-(px(58) + 1)):
+                pass
+            self.hrule(LOOK.PAPER_3, 1, width=W)
+            dpg.add_spacer(height=px(11))
+            b = dpg.add_button(label="重新掃描手機", tag="btn_rescan",
+                               width=W - px(32), height=px(36), indent=px(16),
+                               callback=lambda: self.refresh_all())
+            self.theme(b, "outline")
+        self.align_right("lib_count_sp", "lib_count_grp", "lib_pane", px(16), 0)
+        self.theme("lib_pane", "pane")
+
+    # ---- 中：墨井、播放、時間軸、區間 ----
 
     def _build_editor(self):
-        with dpg.child_window(height=px(-128), tag="edit_pane"):
-            with dpg.group(horizontal=True):
-                dpg.add_spacer(width=px(4))
-                # 影格貼圖要等載入影片、知道原生解析度之後才建得出來
+        with dpg.child_window(tag="edit_pane", width=-(px(INSP_W) + 1),
+                              height=-self._reserve(), border=False,
+                              no_scrollbar=True, always_use_window_padding=True):
+            with dpg.child_window(tag="well", height=px(300), border=True,
+                                  no_scrollbar=True):
+                self.font(dpg.add_text("載入影片後，畫面會出現在這裡",
+                                       tag="well_empty", color=LOOK.ON_WELL_2,
+                                       pos=(px(20), px(20))), "body")
                 with dpg.group(tag="preview_holder"):
-                    dpg.add_text("載入影片後這裡會顯示畫面",
-                                 color=(120, 126, 138, 255))
+                    pass
+                with dpg.child_window(tag="well_tag", border=False, show=False,
+                                      no_scrollbar=True, auto_resize_x=True,
+                                      auto_resize_y=True, pos=(0, 0)):
+                    with dpg.group(horizontal=True, horizontal_spacing=px(5)):
+                        for i, role in enumerate(("small", "num_s", "small",
+                                                  "num_s", "small", "num_s")):
+                            t = dpg.add_text("", tag="well_t%d" % i,
+                                             color=(LOOK.ON_WELL_2 if role == "small"
+                                                    else LOOK.ON_WELL))
+                            self.font(t, role)
+                self.theme("well_tag", "well_tag")
+            self.theme("well", "well")
+            # 墨井自己的主題把間距設成 0，連帶吃掉它下面那一格間距，這裡補回來
+            dpg.add_spacer(height=1)
 
-            # ---- 播放控制 ----
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="播放", tag="btn_play", width=px(70),
-                               callback=self.toggle_play)
-                dpg.add_button(label="|<", width=px(36),
-                               callback=lambda: self.seek_to(0))
-                dpg.add_button(label="-10s", width=px(52),
-                               callback=lambda: self.nudge(-10))
-                dpg.add_button(label="-1s", width=px(46),
-                               callback=lambda: self.nudge(-1))
-                dpg.add_button(label="-1格", width=px(54),
-                               callback=lambda: self.nudge_frame(-1))
-                dpg.add_button(label="+1格", width=px(54),
-                               callback=lambda: self.nudge_frame(1))
-                dpg.add_button(label="+1s", width=px(46),
-                               callback=lambda: self.nudge(1))
-                dpg.add_button(label="+10s", width=px(52),
-                               callback=lambda: self.nudge(10))
-                dpg.add_spacer(width=px(10))
-                dpg.add_radio_button(("原片", "成品"), tag="mode_radio",
-                                     horizontal=True, callback=self.on_mode)
-                dpg.add_spacer(width=px(10))
-                dpg.add_text("", tag="pos_label")
+            # ---- 播放 ----
+            # 寬度夠就一列；不夠的話「原片／成品」和時間碼換到第二列（見 _tick_transport）
+            with dpg.group(tag="transport"):
+              with dpg.group(horizontal=True, horizontal_spacing=px(14),
+                             tag="tp_row1"):
+                with dpg.group(tag="tp_a") as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(4))
+                    with dpg.group(horizontal=True, horizontal_spacing=px(6)):
+                        b = dpg.add_button(label="播放", tag="btn_play",
+                                           width=px(66), height=px(32),
+                                           callback=self.toggle_play)
+                        self.theme(b, "ink")
+                        self.font(b, "strong")
+                        for i, (label, cb) in enumerate((
+                                ("開頭", lambda: self.seek_to(0)),
+                                ("−10s", lambda: self.nudge(-10)),
+                                ("−1s", lambda: self.nudge(-1)),
+                                ("−格", lambda: self.nudge_frame(-1)),
+                                ("格+", lambda: self.nudge_frame(1)),
+                                ("+1s", lambda: self.nudge(1)),
+                                ("+10s", lambda: self.nudge(10)))):
+                            dpg.add_button(label=label, tag="tp_%d" % i,
+                                           height=px(32), callback=cb)
+                with dpg.group(horizontal=True, horizontal_spacing=px(14),
+                               tag="tp_b"):
+                  with dpg.group(tag="tp_seg") as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(4))
+                    self.seg("mode", ("原片", "成品"),
+                             "成品" if self.preview_mode == "result" else "原片",
+                             self.on_mode, height=px(32))
+                  dpg.add_spacer(width=10, tag="tp_sp")
+                  with dpg.group(horizontal=True, horizontal_spacing=px(6),
+                                 tag="tp_clock"):
+                    self.font(dpg.add_text("00:00:00", tag="clock"), "clock")
+                    with dpg.group() as _g:
+                        self.theme(_g, "tight")
+                        # 小字的基線對齊大字：大字在一般群組裡，被 Dear PyGui
+                        # 往下推了 FramePadding.y（px(6)），小字在 tight 裡沒有
+                        dpg.add_spacer(height=max(int(round(
+                            self._baseline_px("clock") - self._baseline_px("num_l")
+                            + px(6))), 0))
+                        self.font(dpg.add_text("", tag="clock_sub",
+                                               color=LOOK.INK_2), "num_l")
+                    # 成品模式的註記是中文，數字字型（Barlow）沒有中文字，
+                    # 所以分成另一個字串、用內文字型
+                    with dpg.group() as _g:
+                        self.theme(_g, "tight")
+                        dpg.add_spacer(height=max(int(round(
+                            self._baseline_px("clock") - self._baseline_px("small")
+                            + px(6))), 0))
+                        self.font(dpg.add_text("", tag="clock_note",
+                                               color=LOOK.INK_2), "small")
+              dpg.add_group(horizontal=True, tag="tp_row2", show=False)
+            self._tp_narrow = False
+            self.align_right("tp_sp", "tp_clock", "edit_pane", px(19), px(14))
 
             # ---- 時間軸 ----
-            dpg.add_spacer(height=px(2))
-            with dpg.group(horizontal=True):
-                dpg.add_text("時間軸")
-                dpg.add_text("（滾輪縮放、拖空白處平移、拖紅塊邊緣調整範圍）",
-                             color=(140, 146, 158, 255))
-                dpg.add_spacer(width=px(8))
-                dpg.add_button(label="全片", width=px(60), callback=self.zoom_all)
-                dpg.add_button(label="看接縫", width=px(76),
-                               callback=self.zoom_seam)
-            dpg.add_drawlist(width=self.tl_w,
-                             height=(self.TL_H_RULER + self.TL_H_BAR
-                                     + self.TL_H_FRAG + self.TL_PAD * 3),
-                             tag="timeline")
+            with dpg.group(horizontal=True, horizontal_spacing=px(12),
+                           tag="tl_head"):
+                self.font(dpg.add_text("時間軸", tag="tl_h"), "head")
+                with dpg.group() as _g:
+                    self.theme(_g, "tight")
+                    dpg.add_spacer(height=px(12))
+                    self.font(dpg.add_text("", tag="tl_desc",
+                                           color=LOOK.INK_2), "small")
+                dpg.add_spacer(width=10, tag="tlh_sp")
+                with dpg.group(horizontal=True, horizontal_spacing=px(6),
+                               tag="tlh_right"):
+                    for tag, label, cb in (("btn_zoom_all", "全片", self.zoom_all),
+                                           ("btn_zoom_seam", "看接縫",
+                                            self.zoom_seam)):
+                        self.theme(dpg.add_button(label=label, tag=tag,
+                                                  height=px(30), callback=cb),
+                                   "ghost")
+            self.align_right("tlh_sp", "tlh_right", "edit_pane", px(19), px(12))
+            dpg.add_drawlist(width=self.tl_w, height=self.TL_H, tag="timeline")
 
-            # ---- 標記 / 區間 ----
-            dpg.add_spacer(height=px(4))
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="設為起點 (I)", width=px(118),
-                               callback=self.set_mark_in)
-                dpg.add_button(label="設為終點 (O)", width=px(118),
-                               callback=self.set_mark_out)
-                dpg.add_text("", tag="mark_label")
-                dpg.add_spacer(width=px(8))
-                dpg.add_button(label="加入移除區間", tag="btn_add_cut",
-                               width=px(140), callback=self.add_cut_from_marks)
-                dpg.add_button(label="清除標記", width=px(96),
-                               callback=self.clear_marks)
-                dpg.add_spacer(width=px(10))
-                dpg.add_text("吸附:")
-                dpg.add_radio_button(("外擴", "內縮"), tag="snap_radio",
-                                     horizontal=True,
-                                     default_value=("外擴"
-                                                    if self.cfg["snap"] == "outer"
-                                                    else "內縮"),
-                                     callback=self.on_snap)
-                with dpg.tooltip("snap_radio"):
-                    dpg.add_text("切點只能落在 fragment 邊界（約每 5 秒一個）。\n"
-                                 "外擴：往外吸，寧可多切掉一點正片。\n"
-                                 "內縮：往內吸，寧可殘留一點廣告。")
-            with dpg.child_window(height=px(108), tag="cuts_pane"):
-                dpg.add_text("還沒有。用上面的「設為起點 / 終點」加一段。",
-                             tag="cuts_empty")
+            # ---- 要移除的區間 ----
+            # 跟左邊的清單一樣自己排列：Dear PyGui 的表格會把每一列撐高，
+            # 而且輸入框和文字的基線對不齊
+            with dpg.child_window(tag="cuts_list", height=self.CUTS_H,
+                                  border=True):
+                pass
+            self.theme("cuts_list", "cuts")
+        self.theme("edit_pane", "work")
 
-            dpg.add_separator()
-            with dpg.group(horizontal=True):
-                dpg.add_button(label="寫入手機", tag="btn_write", width=px(150),
-                               height=px(34), callback=self.confirm_write)
-                dpg.add_button(label="匯出接縫片段", tag="btn_seams",
-                               width=px(160), height=px(34),
-                               callback=self.export_seams)
-                dpg.add_spacer(width=px(14))
-                dpg.add_text("", tag="plan_label", wrap=px(640))
+    # ---- 右：這一支 ----
 
-    def _build_bottom(self):
-        dpg.add_progress_bar(tag="prog", default_value=0.0, width=-1,
-                             overlay="")
-        with dpg.child_window(height=-1, tag="log_area"):
-            pass
+    def _build_inspector(self):
+        """
+        上面是這一支的資料（太長就自己捲），下面固定是動作（吸附、寫入、匯出）——
+        視窗再矮，「備份並寫入手機」都不會被擠到看不到的地方。
+        """
+        with dpg.child_window(tag="insp", width=-1, height=-self._reserve(),
+                              border=False, no_scrollbar=True):
+            with dpg.child_window(tag="insp_info", height=-1, border=False,
+                                  always_use_window_padding=True):
+                dpg.add_group(tag="insp_dyn")
+            self.theme("insp_info", "insp_info")
+            with dpg.child_window(tag="insp_actc", height=-1, border=False,
+                                  no_scrollbar=True,
+                                  always_use_window_padding=True, show=False):
+                dpg.add_group(tag="insp_act")
+            self.theme("insp_actc", "insp_act")
+        self.theme("insp", "insp")
+
+    def _tick_inspector(self):
+        try:
+            h = dpg.get_item_rect_size("insp_act")[1]
+            total = dpg.get_item_rect_size("insp")[1]
+            box = dpg.get_item_rect_size("insp_info")[1]
+            info = dpg.get_item_rect_size("insp_dyn")[1]
+            over = dpg.get_y_scroll_max("insp_info")
+        except Exception:
+            return
+        has = bool(dpg.get_item_children("insp_act", 1))
+        if not has:
+            want = -1
+        elif h > 0 and dpg.is_item_shown("insp_actc"):
+            # 動作緊跟在資料後面；只有放不下的時候才釘在底部、讓資料自己捲
+            need = int(box + over) if over > 0 else int(info) + 2 * px(13)
+            room = int(total - h - px(16))
+            want = need if need <= room else self._whole_rows(room)
+        else:
+            want = -px(330)      # 先給一塊地方讓它畫出來，下一格再量實際高度
+        if dpg.get_item_configuration("insp_info")["height"] != want:
+            dpg.configure_item("insp_info", height=want)
+        if dpg.is_item_shown("insp_actc") != has:
+            dpg.configure_item("insp_actc", show=has)
+
+    def _whole_rows(self, room):
+        """
+        資料區放不下、要捲的時候，把它的高度切在某一列的下緣：
+        最後一列要嘛整列看得到，要嘛整列在捲軸下面，不要切半個字。
+        """
+        try:
+            top = dpg.get_item_state("insp_info")["pos"][1]
+            scroll = dpg.get_y_scroll("insp_info")
+        except Exception:
+            return room
+        items = []
+        for c in dpg.get_item_children("insp_dyn", 1) or []:
+            kids = dpg.get_item_children(c, 1)
+            items.extend(kids if kids else [c])     # 資料列包在一個群組裡
+        limit = room - px(13)                       # 下方內距
+        best = 0
+        for it in items:
+            try:
+                bottom = dpg.get_item_rect_max(it)[1] - top + scroll
+            except Exception:
+                continue
+            if best < bottom <= limit:
+                best = bottom
+        return int(best + px(13)) if best > 0 else room
+
+    # ---- 底列 ----
+
+    def _build_footer(self):
+        with dpg.child_window(tag="foot", height=-1, border=False,
+                              no_scrollbar=True, always_use_window_padding=True):
+            with dpg.group(horizontal=True, horizontal_spacing=px(14)):
+                for tag in ("adb_state", "ff_state", "stage_state"):
+                    self.font(dpg.add_text("", tag=tag, color=LOOK.INK_2),
+                              "small")
+                dpg.add_spacer(width=10, tag="foot_sp")
+                with dpg.group(horizontal=True, horizontal_spacing=px(10),
+                               tag="foot_right"):
+                    # 平常顯示最後一則訊息；忙的時候換成進度
+                    self.font(dpg.add_text("", tag="last_msg"), "small")
+                    self.font(dpg.add_text("", tag="prog_label"), "small")
+                    with dpg.group() as g:
+                        self.theme(g, "tight")
+                        dpg.add_spacer(height=px(4))
+                        p = dpg.add_progress_bar(tag="prog", default_value=0.0,
+                                                 width=px(220), height=px(10),
+                                                 show=False)
+                        self.theme(p, "progress")
+                    b = dpg.add_button(label="訊息", tag="btn_log",
+                                       callback=self.toggle_log)
+                    self.theme(b, "link")
+                    self.font(b, "small")
+        self.align_right("foot_sp", "foot_right", "foot", px(20), px(14))
+        self.theme("foot", "foot")
+        self._sync_footer()
+
+    def toggle_log(self):
+        if dpg.is_item_shown("win_log"):
+            dpg.hide_item("win_log")
+        else:
+            self.show_log()
+
+    def show_log(self):
+        """訊息視窗：開在畫面中間，捲到最底。"""
+        if not dpg.does_item_exist("win_log"):
+            return
+        if not dpg.is_item_shown("win_log"):
+            self.center_window("win_log")
+        dpg.show_item("win_log")
+        dpg.set_y_scroll("log_area", -1.0)
+
+    def copy_log(self):
+        self.copy_text("\n".join(self.log_lines))
+
+    def _sync_footer(self):
+        for tag, text in (("adb_state", self._adb_label),
+                          ("ff_state", self._ff_label),
+                          ("stage_state", self._stage_note)):
+            if dpg.does_item_exist(tag):
+                dpg.set_value(tag, text)
 
     # ---- 預覽貼圖 ----
 
@@ -627,7 +1135,7 @@ class App(object):
         return max(w - w % 2, 16), max(h - h % 2, 16)
 
     def set_preview_texture(self, w, h):
-        """（主執行緒）重建影格貼圖與畫面上的 image 元件。"""
+        """（主執行緒）重建影格貼圖與墨井裡的 image 元件。"""
         self.tex_w, self.tex_h = int(w), int(h)
         self.tex_buf = np.zeros(self.tex_w * self.tex_h * 4, dtype=np.float32)
         if not dpg.does_item_exist("tex_reg"):
@@ -641,42 +1149,106 @@ class App(object):
                             tag="preview_tex", parent="tex_reg")
         self.show_w, self.show_h = self.tex_w, self.tex_h
         dpg.add_image("preview_tex", tag="preview_img", parent="preview_holder",
-                      width=self.show_w, height=self.show_h)
+                      width=self.show_w, height=self.show_h, pos=(0, 0))
+        dpg.configure_item("well_empty", show=False)
+        dpg.configure_item("well_tag", show=True)
         # 換字級會重建貼圖，把最後那張影格補回去，免得預覽空一塊
         if (self._last_frame is not None
                 and self._last_frame.size == self.tex_buf.size):
             np.multiply(self._last_frame, np.float32(1.0 / 255.0),
                         out=self.tex_buf, casting="unsafe")
             dpg.set_value("preview_tex", self.tex_buf)
+        self._fit_key = None
         self.fit_preview()
+
+    def clear_preview(self):
+        if dpg.does_item_exist("preview_holder"):
+            dpg.delete_item("preview_holder", children_only=True)
+        if dpg.does_item_exist("well_empty"):
+            dpg.configure_item("well_empty", show=True)
+        if dpg.does_item_exist("well_tag"):
+            dpg.configure_item("well_tag", show=False)
+        self._fit_key = None
 
     def fit_preview(self):
         """
-        顯示尺寸：塞得進編輯區就用原生大小（1:1 最清楚），塞不進才等比縮小
-        —— 縮小是 GPU 取樣，比先把貼圖做小再放大好得多。
+        墨井的高度 = 編輯欄扣掉底下那一疊（播放列到區間表）—— 量出來而不是猜，
+        換字型、換縮放都不會把區間表擠出畫面。
+        影格：塞得進墨井就用原生大小（1:1 最清楚），塞不進才等比縮小，置中。
         """
-        if not dpg.does_item_exist("preview_img") or not self.tex_h:
-            return
         try:
-            pane_w, pane_h = dpg.get_item_rect_size("edit_pane")
-            avail_w = pane_w - px(24)
-            # 預覽底下那一整疊（播放列到寫入按鈕）有多高 —— 量出來而不是用猜的，
-            # 不然換字型、換縮放、區間列數變了就會把按鈕擠出畫面
-            below = (dpg.get_item_rect_max("btn_write")[1]
-                     - dpg.get_item_rect_min("btn_play")[1])
+            pane_h = dpg.get_item_rect_size("edit_pane")[1]
+            th = dpg.get_item_rect_size("transport")[1]
+            hh = dpg.get_item_rect_size("tl_head")[1]
+            ww, wh = dpg.get_item_rect_size("well")
         except Exception:
             return
-        if avail_w < px(200) or pane_h <= 0:
+        if pane_h > 0 and th > 0 and hh > 0:
+            pad, gap = px(15), px(10)
+            want = int(pane_h - 2 * pad - 4 * gap - th - hh - self.TL_H
+                       - self.CUTS_H - px(4))
+            want = max(want, px(120))
+            # 視窗很矮的時候區間表少一列，把高度讓給畫面
+            compact = want < px(200) or (self._cuts_compact and want < px(250))
+            if compact != self._cuts_compact:
+                self._cuts_compact = compact
+                self.CUTS_H = self.ROW_H_HEAD + (3 if compact else 4) * (
+                    self.ROW_H + 1) + 2
+                dpg.configure_item("cuts_list", height=self.CUTS_H)
+                return
+            if want != self._below_h:
+                self._below_h = want
+                dpg.configure_item("well", height=want)
+
+        if not dpg.does_item_exist("preview_img") or not self.tex_h:
+            if dpg.does_item_exist("well_empty"):
+                tw = self.measure(dpg.get_value("well_empty"), "body")
+                dpg.configure_item("well_empty", pos=(
+                    max(int((ww - tw) / 2), px(10)),
+                    max(int((wh - px(17)) / 2), px(10))))
             return
-        if not (px(260) <= below <= px(760)):
-            below = self._below_h or px(460)
-        self._below_h = below
-        avail_h = max(pane_h - below - px(28), px(160))
-        k = min(1.0, avail_w / float(self.tex_w), avail_h / float(self.tex_h))
-        w, h = max(int(self.tex_w * k), 16), max(int(self.tex_h * k), 16)
-        if (w, h) != (self.show_w, self.show_h):
+        m = px(12)
+        try:
+            tag_h = dpg.get_item_rect_size("well_tag")[1] or px(26)
+        except Exception:
+            tag_h = px(26)
+        # 解析度那行字放在畫面下方留給它的一條黑邊裡，不疊在畫面上；
+        # 畫面小到放不下（寬不到 300）就不顯示那行字，黑邊也不留
+        strip = tag_h + px(10)
+
+        def fit(bottom):
+            k = min(1.0, (ww - 2 * m) / float(self.tex_w),
+                    (wh - m - bottom) / float(self.tex_h))
+            return k, max(int(self.tex_w * k), 16), max(int(self.tex_h * k), 16)
+
+        k, w, h = fit(strip)
+        show_tag = w >= px(300)
+        if not show_tag:
+            k, w, h = fit(m)
+            strip = m
+        key = (w, h, int(ww), int(wh))
+        if key != self._fit_key:
+            self._fit_key = key
             self.show_w, self.show_h = w, h
-            dpg.configure_item("preview_img", width=w, height=h)
+            dpg.configure_item("preview_img", width=w, height=h,
+                               pos=(int((ww - w) / 2),
+                                    int(m + (wh - m - strip - h) / 2)))
+            nw, nh = self._native if self._native[0] else (self.tex_w, self.tex_h)
+            scale = ("×1" if k >= 0.999 else "×%.2f" % (w / float(nw)))
+            for i, text in enumerate(("原生", "%d×%d" % (nw, nh), "· 顯示",
+                                      "%d×%d" % (w, h), "· 縮放", scale)):
+                dpg.set_value("well_t%d" % i, text)
+        try:
+            tw, th = dpg.get_item_rect_size("well_tag")
+        except Exception:
+            return
+        if tw > 0:
+            pos, show = (int(ww - tw - px(10)), int(wh - th - px(5))), \
+                show_tag
+            if dpg.is_item_shown("well_tag") != show:
+                dpg.configure_item("well_tag", show=show)
+            if tuple(dpg.get_item_pos("well_tag")) != pos:
+                dpg.configure_item("well_tag", pos=pos)
 
     def on_preview_quality(self, sender, app_data):
         self.cfg["preview_quality"] = app_data
@@ -695,7 +1267,7 @@ class App(object):
         with dpg.file_dialog(directory_selector=False, show=False,
                              tag="dlg_backup_file", width=px(760), height=px(460),
                              callback=self.on_pick_backup_file):
-            dpg.add_file_extension(BK.EXT, color=(140, 220, 160, 255))
+            dpg.add_file_extension(BK.EXT, color=LOOK.OK)
             dpg.add_file_extension(".*")
 
         with dpg.window(label="還原備份", tag="win_restore", show=False,
@@ -711,8 +1283,11 @@ class App(object):
             dpg.add_separator()
             dpg.add_text("", tag="restore_detail", wrap=px(890))
             with dpg.group(horizontal=True):
-                dpg.add_button(label="還原到手機", tag="btn_do_restore",
-                               width=px(150), callback=self.do_restore_selected)
+                b = dpg.add_button(label="還原到手機", tag="btn_do_restore",
+                                   width=px(150), height=px(36),
+                                   callback=self.do_restore_selected)
+                self.theme(b, "write")
+                self.font(b, "strong")
                 dpg.add_button(label="只核對備份完整性", width=px(180),
                                callback=self.verify_selected)
                 dpg.add_button(label="關閉", width=px(96),
@@ -723,9 +1298,11 @@ class App(object):
             dpg.add_text("", tag="confirm_text", wrap=px(690))
             dpg.add_separator()
             with dpg.group(horizontal=True):
-                dpg.add_button(label="備份並寫入", width=px(160),
-                               callback=self.do_write)
-                dpg.add_button(label="取消", width=px(96),
+                b = dpg.add_button(label="備份並寫入", width=px(160),
+                                   height=px(40), callback=self.do_write)
+                self.theme(b, "write")
+                self.font(b, "strong")
+                dpg.add_button(label="取消", width=px(96), height=px(40),
                                callback=lambda: dpg.hide_item("win_confirm"))
 
         with dpg.window(label="環境檢查", tag="win_env", show=False,
@@ -743,10 +1320,21 @@ class App(object):
                                callback=self.fill_env_window)
                 dpg.add_button(label="開啟 tools 資料夾", width=px(190),
                                callback=self.open_tools_dir)
-                dpg.add_button(label="把結果寫進訊息區", width=px(190),
+                dpg.add_button(label="把結果寫進訊息", width=px(190),
                                callback=self.log_env_check)
                 dpg.add_button(label="關閉", width=px(96),
                                callback=lambda: dpg.hide_item("win_env"))
+
+        with dpg.window(label="訊息", tag="win_log", show=False,
+                        width=px(860), height=px(520), no_collapse=True):
+            with dpg.child_window(tag="log_area", border=False, height=-px(46)):
+                pass
+            self.theme("log_area", "log")
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="全部複製", width=px(120),
+                               callback=self.copy_log)
+                dpg.add_button(label="關閉", width=px(96),
+                               callback=lambda: dpg.hide_item("win_log"))
 
         with dpg.window(label="這個工具的限制", tag="win_help", show=False,
                         modal=True, width=px(760), height=px(460)):
@@ -772,9 +1360,17 @@ class App(object):
                 ("btn_seams", loaded and has_cuts and not self.busy),
                 ("btn_add_cut", loaded and self.mark_in is not None
                  and self.mark_out is not None),
-                ("mode_radio", loaded),
-                ("device_combo", not self.busy),
-        ):
+                ("btn_mark_in", loaded),
+                ("btn_mark_out", loaded),
+                ("btn_clear_marks", loaded and (self.mark_in is not None
+                                                or self.mark_out is not None)),
+                ("seg_mode_0", loaded),
+                ("seg_mode_1", loaded),
+                ("chip_dev", not self.busy),
+                ("btn_zoom_all", loaded),
+                ("btn_zoom_seam", loaded and has_cuts),
+                ("btn_rescan", not self.busy),
+        ) + tuple(("tp_%d" % i, loaded) for i in range(7)):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=bool(on))
 
@@ -783,12 +1379,16 @@ class App(object):
     # ======================================================================= #
 
     def startup(self):
-        dpg.set_value("backup_dir_label", self.cfg["backup_dir"])
+        self._sync_backup_label()
         ok, msg = DEV.check_adb()
-        self._adb_label = "OK" if ok else "找不到"
-        self._adb_color = (120, 220, 140, 255) if ok else (240, 120, 120, 255)
-        dpg.set_value("adb_state", self._adb_label)
-        dpg.configure_item("adb_state", color=self._adb_color)
+        m = re.search(r"version\s+([\d.]+)", msg)
+        if ok:
+            self._adb_label = "adb %s" % m.group(1) if m else "adb 可用"
+        else:
+            self._adb_label = "找不到 adb"
+        self._ff_label = "ffmpeg 檢查中…" if MED.have_ffmpeg() else "找不到 ffmpeg"
+        self._sync_footer()
+        self._probe_ffmpeg()
         self.log("%s v%s 啟動" % (APP_NAME, ENV.VERSION))
         self.log("adb：%s" % msg)
         if not MED.have_ffmpeg() or not MED.have_ffplay():
@@ -807,22 +1407,51 @@ class App(object):
         if not ok or not MED.have_ffmpeg():
             self.show_env_window()
 
-    STATE_COLOR = {"ok": (120, 220, 140, 255),
-                   "warn": (235, 200, 110, 255),
-                   "bad": (240, 120, 120, 255)}
+    def _probe_ffmpeg(self):
+        """底列要寫 ffmpeg 的版本；問一次要幾十毫秒，丟到背景。"""
+        if not MED.have_ffmpeg():
+            return
+
+        def body():
+            label = "ffmpeg 可用"
+            try:
+                out = subprocess.run([ENV.path("ffmpeg"), "-version"],
+                                     capture_output=True, timeout=20,
+                                     creationflags=getattr(
+                                         subprocess, "CREATE_NO_WINDOW", 0))
+                first = out.stdout.decode("utf-8", "replace").splitlines()[0]
+                # 正式版是 8.0 這種號碼；每日建置（gyan.dev 的 git 版）是日期
+                m = (re.search(r"version\s+(\d{4}-\d{2}-\d{2})", first)
+                     or re.search(r"version\s+n?([\d.]+)", first))
+                if m:
+                    label = "ffmpeg %s" % m.group(1)
+            except (OSError, IndexError, subprocess.SubprocessError):
+                pass
+
+            def done():
+                self._ff_label = label
+                self._sync_footer()
+            self.post(done)
+        threading.Thread(target=body, name="ffmpeg-version", daemon=True).start()
+
+    # 環境檢查視窗裡的狀態標記。紅色留給刪除號，缺東西用黑字加粗表示。
+    STATE_COLOR = {"ok": LOOK.OK, "warn": LOOK.WARN, "bad": LOOK.INK}
+
+    @staticmethod
+    def center_window(tag):
+        """DPG 的視窗預設貼在左上角；開在畫面中間比較像一回事。"""
+        try:
+            cfg = dpg.get_item_configuration(tag)
+            vw = dpg.get_viewport_client_width()
+            vh = dpg.get_viewport_client_height()
+            dpg.configure_item(tag, pos=[max((vw - cfg["width"]) // 2, 0),
+                                         max((vh - cfg["height"]) // 2, 0)])
+        except Exception:
+            pass
 
     def show_env_window(self):
         self.fill_env_window()
-        # DPG 的 modal 預設貼在左上角，開在畫面中間比較像一回事
-        try:
-            cfg = dpg.get_item_configuration("win_env")
-            vw = dpg.get_viewport_client_width()
-            vh = dpg.get_viewport_client_height()
-            dpg.configure_item("win_env",
-                               pos=[max((vw - cfg["width"]) // 2, 0),
-                                    max((vh - cfg["height"]) // 2, 0)])
-        except Exception:
-            pass
+        self.center_window("win_env")
         dpg.show_item("win_env")
 
     def env_rows(self):
@@ -918,6 +1547,7 @@ class App(object):
             self.log("有必要的東西缺了 —— 看「說明 → 環境檢查」那個視窗，"
                      "裡面有下載連結與放法。")
         self.log("—— 檢查完畢 ——")
+        self.show_log()
 
     def refresh_all(self):
         def work():
@@ -926,9 +1556,12 @@ class App(object):
                 raise DEV.AdbError(
                     "adb 看不到裝置。確認手機已用 USB 連接、開啟「USB 偵錯」，"
                     "並在手機上允許這台電腦。")
-            dev = devs[0]
+            dev = self.device if self.device in devs else devs[0]
+            for d in devs:
+                if self.device is not None and d.serial == self.device.serial:
+                    dev = d
             self.log("裝置：%s" % dev.label)
-            self.progress(0.1, "找 B站 的緩存目錄")
+            self.progress(0.1, "找 B站 的快取目錄")
             roots = dev.find_roots()
             if not roots:
                 raise DEV.AdbError(
@@ -948,95 +1581,304 @@ class App(object):
             devs, dev, roots, items = res
             self.devices, self.device, self.roots, self.items = \
                 devs, dev, roots, items
-            dpg.configure_item("device_combo",
-                               items=[d.label for d in devs],
-                               default_value=dev.label)
             self.log("共 %d 支緩存影片，其中 %d 支可以處理。"
                      % (len(items),
                         sum(1 for i in items if i.unsupported_reason() is None)))
+            self._sync_device_ui()
             self.rebuild_library()
             self.progress(0.0, "")
 
         self.run_worker("掃描", work, done)
 
-    def on_device_pick(self, sender, app_data):
-        for d in self.devices:
-            if d.label == app_data:
-                self.device = d
-                self.log("改用裝置 %s" % d.label)
-                self.refresh_all()
-                return
+    def on_device_pick(self, sender, app_data, user_data):
+        if not (0 <= user_data < len(self.devices)):
+            return
+        d = self.devices[user_data]
+        if self.device is not None and d.serial == self.device.serial:
+            return
+        self.device = d
+        self.log("改用裝置 %s" % d.label)
+        self._sync_device_ui()
+        self.refresh_all()
 
-    def rebuild_library(self):
+    # ---- 清單 ----
+
+    def rebuild_library(self, *_):
+        """
+        每一列的家具固定：標題最多兩行、時長、畫質、大小；不能剪的印灰並寫出原因。
+        列是自己排的（絕對座標）：Dear PyGui 的 selectable 只有一行字，
+        要做出兩行標題加一行說明、整列都能點，只能把字疊在一個等高的 selectable 上。
+        """
+        if not dpg.does_item_exist("lib_list"):
+            return
         needle = (dpg.get_value("lib_filter") or "").strip().lower()
         self.filtered = [it for it in self.items
                          if not needle or needle in it.display_name.lower()
                          or needle in (it.owner or "").lower()
                          or needle in str(it.cid)]
+        dpg.set_value("lib_count", str(len(self.items)) if self.items else "")
         dpg.delete_item("lib_list", children_only=True)
+        W = px(LIB_W)
+        x = px(16)
+        text_w = W - px(32) - px(11)          # 右邊留給捲軸
         if not self.filtered:
-            dpg.add_text("沒有符合的影片。" if self.items
-                         else "這台手機上沒有找到緩存影片。", parent="lib_list")
+            if self.items:
+                msg = "沒有符合「%s」的影片。" % needle
+            elif self.device is None:
+                msg = "還沒連上手機。接上 USB、開啟「USB 偵錯」，再按下面的「重新掃描手機」。"
+            else:
+                msg = "這台手機上沒有找到快取影片。先在 B站 App 裡下載幾支。"
+            for i, line in enumerate(self.wrap(msg, "small", text_w, 4)):
+                self.font(dpg.add_text(line, parent="lib_list", color=LOOK.INK_2,
+                                       pos=(x, px(14) + i * px(21))), "small")
             return
+
+        lh, lh_s = px(LOOK.SIZES["body"]), px(LOOK.SIZES["small"])
+        y = 0
         for n, it in enumerate(self.filtered):
             bad = it.unsupported_reason()
-            with dpg.group(parent="lib_list"):
-                dpg.add_selectable(label=it.display_name, user_data=n,
-                                   callback=self.on_item_pick,
-                                   tag="sel_%d" % n)
-                meta = "    %s · %s · %s" % (
-                    it.quality_desc or ("q" + it.quality_dir),
-                    fmt_time(it.duration_s), fmt_bytes(it.total_bytes))
-                dpg.add_text(meta, color=(146, 152, 164, 255))
-                if bad:
-                    dpg.add_text("    ⚠ " + bad, color=(226, 170, 90, 255),
-                                 wrap=px(400))
-        if self.item in self.filtered:
-            tag = "sel_%d" % self.filtered.index(self.item)
-            if dpg.does_item_exist(tag):
-                dpg.set_value(tag, True)
+            sel = it is self.item
+            role = self.role_for(it.display_name, "strong" if sel else "body")
+            lines = self.wrap(it.display_name, role, text_w, 2)
+            why = self.wrap("不能剪：" + bad, "small", text_w, 2) if bad else []
+            h = (px(10) + len(lines) * (lh + px(4)) + px(2) + lh_s
+                 + (px(5) + len(why) * (lh_s + px(3)) if why else 0) + px(10))
+            dpg.add_selectable(label="", tag="sel_%d" % n, parent="lib_list",
+                               pos=(0, y), height=h, default_value=sel,
+                               user_data=n, callback=self.on_item_pick)
+            ty = y + px(10)
+            for line in lines:
+                self.font(dpg.add_text(line, parent="lib_list", pos=(x, ty),
+                                       color=LOOK.INK_2 if bad else LOOK.INK),
+                          role)
+                ty += lh + px(4)
+            ty += px(2)
+            mx = x
+            quality = it.quality_desc or ("q" + it.quality_dir)
+            for text, r, col in ((fmt_time(it.duration_s), "num_s", LOOK.INK_2),
+                                 (quality, "num_s" if quality.isascii()
+                                  else "strong_s", LOOK.INK),
+                                 (fmt_bytes(it.total_bytes), "num_s", LOOK.INK_2)):
+                r = self.role_for(text, r)
+                self.font(dpg.add_text(text, parent="lib_list", pos=(mx, ty),
+                                       color=col), r)
+                mx += int(self.measure(text, r)) + px(12)
+            ty += lh_s
+            if why:
+                ty += px(5)
+                for line in why:
+                    self.font(dpg.add_text(line, parent="lib_list", pos=(x, ty),
+                                           color=LOOK.INK_2), "small")
+                    ty += lh_s + px(3)
+            y += h
+            self.hrule(LOOK.PAPER_3, 1, width=W, parent="lib_list", track=False,
+                       pos=(0, y))
+            y += 1
 
     def on_item_pick(self, sender, app_data, user_data):
+        item = self.filtered[user_data]
         for n in range(len(self.filtered)):
             tag = "sel_%d" % n
             if dpg.does_item_exist(tag):
                 dpg.set_value(tag, n == user_data)
-        self.select_item(self.filtered[user_data])
+        if item is not self.item:
+            self.select_item(item)
+        # 選中的那一列標題換粗體：要重排，而且不要在這個 selectable 自己的
+        # 回呼裡把它刪掉，留到下一格做
+        self.post(self.rebuild_library)
 
     def select_item(self, item):
         self.item = item
         self.unload_video()
         self.show_selection()
+        # 底列那則訊息講的是上一支，換了就不要再掛著
+        if dpg.does_item_exist("last_msg"):
+            dpg.set_value("last_msg", "")
 
     def show_selection(self):
-        """只更新右下角那幾行說明。重建介面時也要用，所以不能順手卸載影片。"""
-        item = self.item
-        if item is None:
-            return
-        dpg.set_value("sel_title", item.display_name)
-        dpg.set_value("sel_meta", "%s · %s · %s · UP %s\ncid %s · %s"
-                      % (item.quality_desc or ("q" + item.quality_dir),
-                         fmt_time(item.duration_s), fmt_bytes(item.total_bytes),
-                         item.owner or "?", item.cid, item.root.label))
-        bad = item.unsupported_reason()
-        if bad:
-            dpg.set_value("sel_state", "不能處理：" + bad)
-            dpg.configure_item("sel_state", color=(240, 150, 100, 255))
-            self.sync_enabled()
-            return
-        dpg.configure_item("sel_state", color=(170, 176, 188, 255))
-        local = self.stage_dir / item.device_path.rsplit("/", 1)[-1]
-        st = DEV.stage_state(local)
-        hist = st.get("history") or []
-        if st.get("orig"):
-            note = "本機已有暫存副本，載入很快。"
-        else:
-            note = "本機還沒有這支，載入要從手機傳 %s。" % fmt_bytes(
-                item.total_bytes)
-        if hist:
-            note += "　這支在這台電腦上剪過 %d 次。" % len(hist)
-        dpg.set_value("sel_state", note)
+        """重畫右邊「這一支」。重建介面時也要用，所以不能順手卸載影片。"""
+        self.refresh_inspector()
         self.sync_enabled()
+
+    # ---- 右：這一支 ----
+
+    def _insp_width(self):
+        try:
+            w = dpg.get_item_rect_size("insp")[0]
+        except Exception:
+            w = 0
+        if w <= 0:
+            w = px(INSP_W)
+        return int(w - 2 * px(16) - px(11) - 1)
+
+    def kv(self, parent, label, value, color=LOOK.INK, width=0):
+        """
+        資訊欄的一列：左邊名稱、右邊數值（靠右）。
+        數值裡的英數字用數字字型、中文用內文，兩者都是一般體 —— 「2 段 · 120.0 s」
+        這種混排的值才不會一半粗一半細。
+        """
+        lw = self.measure(label, "small")
+        room = width - lw - px(12)
+        runs = [(r, "num_v" if r.isascii() else "body")
+                for r in _ASCII_RUN.findall(value)]
+        runs = [(r, self.role_for(r, role)) for r, role in runs]
+        vw = sum(self.measure(r, role) for r, role in runs)
+        if vw > room:                  # 太長（通常是作者名）：整串用內文截短
+            value = self.wrap(value, "body", room, 1)[0]
+            runs = [(value, "body")]
+            vw = self.measure(value, "body")
+        parts = [(label, "small", LOOK.INK_2)] + [(r, role, color)
+                                                  for r, role in runs]
+        base = {role: self._baseline_px(role) for _, role, _ in parts}
+        top = max(base.values())
+        with dpg.group(horizontal=True, horizontal_spacing=0, parent=parent):
+            for i, (text, role, col) in enumerate(parts):
+                if i == 1:
+                    dpg.add_spacer(width=max(int(width - lw - vw), px(8)))
+                drop = int(round(top - base[role]))
+                if drop > 0:          # 基線對齊：基線比較高的往下推
+                    with dpg.group() as g:
+                        self.theme(g, "tight")
+                        dpg.add_spacer(height=drop)
+                        self.font(dpg.add_text(text, color=col), role)
+                else:
+                    self.font(dpg.add_text(text, color=col), role)
+
+    def _baseline_px(self, role):
+        """這個字型角色的基線離行頂幾個像素。"""
+        face, size_key = LOOK.FONT_ROLES[role]
+        size = px(LOOK.SIZES[size_key])
+        ratio = BF.baseline(self.font_files.get(face)) if \
+            self.font_files.get(face) else None
+        return size * (ratio if ratio else 0.8)
+
+    def media_sizes(self):
+        """(視訊位元組, 音訊位元組)；沒載入就是 (None, None)。"""
+        if self.q_dir is None:
+            return None, None
+        out = []
+        for name in ("video.m4s", "audio.m4s"):
+            try:
+                out.append(os.path.getsize(str(Path(self.q_dir) / name)))
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    def refresh_inspector(self):
+        if not dpg.does_item_exist("insp_dyn"):
+            return
+        P = "insp_dyn"
+        dpg.delete_item(P, children_only=True)
+        dpg.delete_item("insp_act", children_only=True)
+        A = "insp_act"
+        W = self._insp_width()
+        self.font(dpg.add_text("這一支", parent=P), "head")
+        it = self.item
+        if it is None:
+            self.font(dpg.add_text("從左邊的清單挑一支影片。", parent=P,
+                                   wrap=W, color=LOOK.INK_2), "body")
+            return
+
+        title_role = self.role_for(it.display_name, "title")
+        self.font(dpg.add_text(it.display_name, parent=P, wrap=W), title_role)
+        dpg.add_spacer(height=px(2), parent=P)
+        self.hrule(LOOK.PAPER_3, 1, width=W, parent=P, track=False)
+
+        loaded = self.vtrack is not None
+        quality = it.quality_desc or ("q" + it.quality_dir)
+        outer, P = P, dpg.add_group(parent=P)
+        self.theme(P, "kv")
+        self.kv(P, "作者", it.owner or "—", width=W)
+        self.kv(P, "cid", str(it.cid), width=W)
+        self.kv(P, "畫質", quality, width=W)
+        if not loaded:
+            self.kv(P, "長度", fmt_dur(it.duration_s), width=W)
+            self.kv(P, "大小", fmt_bytes(it.total_bytes), width=W)
+        else:
+            snap, _ = self.snapped()
+            snap = snap or []
+            removed = sum(b - a for a, b in snap)
+            red = LOOK.VERMILION if snap else LOOK.INK
+            self.kv(P, "原長", fmt_dur(self.duration), width=W)
+            self.kv(P, "新長", fmt_dur(self.duration - removed),
+                    color=red, width=W)
+            self.kv(P, "移除", ("%d 段 · %.1f s" % (len(snap), removed))
+                    if snap else "還沒有", color=red, width=W)
+            vb, ab = self.media_sizes()
+            if vb is not None:
+                self.kv(P, "視訊", "{:,}".format(vb), width=W)
+            if ab is not None:
+                self.kv(P, "音訊", "{:,}".format(ab), width=W)
+            total = len(self.vtrack.frags)
+            gone = 0
+            for a, b in snap:
+                gone += max(bisect_right(self.bounds, b + 1e-6)
+                            - bisect_left(self.bounds, a - 1e-6) - 1, 0)
+            self.kv(P, "fragment", "%d → %d" % (total, total - gone)
+                    if gone else str(total), width=W)
+
+        P = outer
+
+        bad = it.unsupported_reason()
+        if bad:
+            self.hrule(LOOK.PAPER_3, 1, width=W, parent=A, track=False)
+            self.font(dpg.add_text("不能剪：" + bad, parent=A, wrap=W), "body")
+            return
+
+        if not loaded:
+            local = self.stage_dir / it.device_path.rsplit("/", 1)[-1]
+            st = DEV.stage_state(local)
+            hist = st.get("history") or []
+            if st.get("orig"):
+                note = "本機已有暫存副本，載入很快。"
+            else:
+                note = "本機還沒有這支，載入要從手機傳 %s。" % fmt_bytes(
+                    it.total_bytes)
+            if hist:
+                note += "這支在這台電腦上剪過 %d 次。" % len(hist)
+            self.hrule(LOOK.PAPER_3, 1, width=W, parent=A, track=False)
+            self.font(dpg.add_text(note, parent=A, wrap=W, color=LOOK.INK_2),
+                      "small")
+            b = dpg.add_button(label="載入以編輯", tag="btn_load", parent=A,
+                               width=W, height=px(44),
+                               callback=lambda: self.on_load_clicked(False))
+            self.theme(b, "ink")
+            self.font(b, "strong")
+            if st.get("orig"):
+                b = dpg.add_button(label="放棄暫存，重新從手機拉", parent=A,
+                                   width=W, height=px(34),
+                                   callback=lambda: self.on_load_clicked(True))
+                self.theme(b, "flat")
+                self.font(b, "small")
+            return
+
+        self.hrule(LOOK.PAPER_3, 1, width=W, parent=A, track=False)
+        self.font(dpg.add_text("吸附方向", parent=A, color=LOOK.INK_2), "small")
+        with dpg.group(parent=A):
+            self.seg("snap", ("外擴", "內縮"),
+                     "外擴" if self.cfg["snap"] == "outer" else "內縮",
+                     self.on_snap, width=W // 2, height=px(32))
+        with dpg.tooltip(self._segs["snap"]["tags"][0]):
+            dpg.add_text("切點只能落在 fragment 邊界（約每 5 秒一個）。\n"
+                         "外擴：往外吸，寧可多切掉一點正片。")
+        with dpg.tooltip(self._segs["snap"]["tags"][1]):
+            dpg.add_text("切點只能落在 fragment 邊界（約每 5 秒一個）。\n"
+                         "內縮：往內吸，寧可殘留一點廣告。")
+        dpg.add_spacer(height=px(2), parent=A)
+        b = dpg.add_button(label="備份並寫入手機", tag="btn_write", parent=A,
+                           width=W, height=px(50), callback=self.confirm_write)
+        self.theme(b, "write")
+        self.font(b, "action")
+        b = dpg.add_button(label="匯出接縫片段", tag="btn_seams", parent=A,
+                           width=W, height=px(36), callback=self.export_seams)
+        self.theme(b, "ghost")
+        vb, _ = self.media_sizes()
+        warn = ("寫入前一定會先存一份乾淨原檔到 %s。" % short_path(
+            self.cfg["backup_dir"], 1))
+        if vb is not None:
+            warn += "檔案大小維持 {:,} bytes —— 手機容量不會變少。".format(vb)
+        self.font(dpg.add_text(warn, parent=A, wrap=W, color=LOOK.INK_2),
+                  "small")
 
     @property
     def stage_dir(self):
@@ -1072,18 +1914,21 @@ class App(object):
                         fmt_time(vt.duration_s())))
             self.log(self.describe_version(local, vt))
             src = None
+            native = (0, 0)
             if MED.have_ffmpeg():
                 info = MED.probe(q / "video.m4s")
+                native = (int(info["width"] or 0), int(info["height"] or 0))
                 tw, th = self.texture_size_for(info["width"], info["height"])
                 self.log("畫面 %dx%d @ %.3g fps（%s），預覽用 %dx%d"
                          % (info["width"], info["height"], info["fps"],
                             info["codec"], tw, th))
                 src = MED.FrameSource(q / "video.m4s", tw, th)
             self.progress(1.0, "完成")
-            return local, q, vt, src
+            return local, q, vt, src, native
 
         def done(res):
-            local, q, vt, src = res
+            local, q, vt, src, native = res
+            self._native = native
             self.local, self.q_dir, self.vtrack = local, q, vt
             self.duration = vt.duration_s()
             self.bounds = vt.boundaries()
@@ -1101,6 +1946,8 @@ class App(object):
                 self.scrub.request(0.0)
             else:
                 self.player = None
+                self.clear_preview()
+            self._sync_footer()
             self.zoom_all()
             self.refresh_cuts_ui()
             self.progress(0.0, "")
@@ -1139,6 +1986,7 @@ class App(object):
             ok, why = self.verify_staged(local, st["orig"])
             if ok:
                 self.log("重用本機暫存 %s（與手機上那一份一致）" % local)
+                self._stage_note = "暫存已驗證 · 重用"
                 return local
             self.log("本機暫存不能用：%s —— 重新拉一次。" % why)
             shutil.rmtree(local, ignore_errors=True)
@@ -1164,6 +2012,7 @@ class App(object):
             "pulled_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
         self.log("已拉到 %s" % local)
+        self._stage_note = "剛從手機拉取 · 已記下 md5"
         return Path(local)
 
     def verify_staged(self, local, orig):
@@ -1221,6 +2070,14 @@ class App(object):
         if self.tex_buf is not None and dpg.does_item_exist("preview_tex"):
             self.tex_buf[:] = 0.0
             dpg.set_value("preview_tex", self.tex_buf)
+        self._last_frame = None
+        self.tex_h = 0
+        self._native = (0, 0)
+        self._stage_note = ""
+        self._sync_footer()
+        self.clear_preview()
+        self.preview_mode = "source"
+        self.set_seg("mode", "原片")
         self.refresh_cuts_ui()
 
     # ======================================================================= #
@@ -1321,63 +2178,154 @@ class App(object):
         self.seek_to(max(a - 3, 0))
         self.zoom_to(a - 10, b + 10)
 
-    def refresh_cuts_ui(self):
-        dpg.delete_item("cuts_pane", children_only=True)
-        if not self.cuts:
-            dpg.add_text("還沒有。用上面的「設為起點 / 終點」加一段。",
-                         parent="cuts_pane", color=(146, 152, 164, 255))
-        snap, rows = self.snapped()
-        if snap is None:
-            dpg.add_text("吸附失敗：%s" % rows, parent="cuts_pane",
-                         color=(240, 150, 100, 255), wrap=px(640))
-            rows = []
-        for i, cut in enumerate(self.cuts):
-            row = rows[i] if i < len(rows) else None
-            with dpg.group(parent="cuts_pane", horizontal=True):
-                dpg.add_text("%d." % (i + 1))
-                dpg.add_input_text(default_value=fmt_time(cut[0], True),
-                                   width=px(100), user_data=(i, 0),
-                                   callback=self.on_cut_edit,
-                                   on_enter=True)
-                dpg.add_text("→")
-                dpg.add_input_text(default_value=fmt_time(cut[1], True),
-                                   width=px(100), user_data=(i, 1),
-                                   callback=self.on_cut_edit,
-                                   on_enter=True)
-                dpg.add_text("%5.1f s" % (cut[1] - cut[0]),
-                             color=(170, 176, 188, 255))
-                dpg.add_button(label="看", width=px(38), user_data=i,
-                               callback=self.goto_cut)
-                dpg.add_button(label="移除", width=px(60), user_data=i,
-                               callback=self.del_cut)
-                if row is not None:
-                    _, _, sa, sb = row
-                    dpg.add_text("實際切 %s - %s（%+.2f / %+.2f s）"
-                                 % (fmt_time(sa, True), fmt_time(sb, True),
-                                    sa - cut[0], sb - cut[1]),
-                                 color=(200, 180, 110, 255))
+    def _cut_cols(self, W):
+        """區間表的欄位：(左緣, 寬)。起、迄兩欄平分剩下的寬度。"""
+        pad, gap = px(13), px(12)
+        fixed = (("tick", px(16)), ("len", px(80)), ("snap", px(116)),
+                 ("look", px(36)), ("del", px(52)))
+        half = int((W - 2 * pad - sum(w for _, w in fixed) - 6 * gap) / 2)
+        if half < px(112):
+            # 窄的時候先拿掉「吸附」那欄（滑到長度上看得到），間距也收緊，
+            # 起迄要放得下到毫秒的時間
+            pad, gap = px(10), px(7)
+            fixed = (("tick", px(14)), ("len", px(66)), ("look", px(30)),
+                     ("del", px(46)))
+            half = max(int((W - 2 * pad - sum(w for _, w in fixed)
+                            - 5 * gap) / 2), px(96))
+        order = (fixed[0], ("a", half), ("b", half)) + fixed[1:]
+        cols, x = {}, pad
+        for key, w in order:
+            cols[key] = (x, w)
+            x += w + gap
+        return cols
 
-        total_cut = sum(b - a for a, b in (snap or []))
-        if self.vtrack is not None:
-            dpg.set_value("plan_label",
-                          "原片 %s → 成品 %s（移除 %d 段，共 %s）"
-                          % (fmt_time(self.duration),
-                             fmt_time(self.duration - total_cut),
-                             len(snap or []), fmt_time(total_cut)))
-        else:
-            dpg.set_value("plan_label", "")
-        marks = []
-        if self.mark_in is not None:
-            marks.append("起 %s" % fmt_time(self.mark_in, True))
-        if self.mark_out is not None:
-            marks.append("迄 %s" % fmt_time(self.mark_out, True))
-        dpg.set_value("mark_label", "   ".join(marks))
+    def refresh_cuts_ui(self):
+        self._fill_cuts_table()
+        self.refresh_inspector()
         self.apply_segments()
         self.request_redraw()
         self.sync_enabled()
 
-    def on_snap(self, sender, app_data):
-        self.cfg["snap"] = "outer" if app_data.startswith("外擴") else "inner"
+    def _fill_cuts_table(self):
+        L = "cuts_list"
+        if not dpg.does_item_exist(L):
+            return
+        dpg.delete_item(L, children_only=True)
+        W = int(self.tl_w) - px(11) - 2          # 右邊留給捲軸
+        C = self._cut_cols(W)
+        HH, RH = self.ROW_H_HEAD, self.ROW_H
+        lh = px(LOOK.SIZES["body"])
+        lh_s = px(LOOK.SIZES["small"])
+
+        def text(s, key, y, role="num", color=LOOK.INK, h=RH):
+            x = C[key][0]
+            t = dpg.add_text(s, parent=L, color=color,
+                             pos=(x, y + (h - (lh_s if role in ("small", "num_s")
+                                               else lh)) // 2))
+            self.font(t, role)
+            return t
+
+        def button(label, key, y, theme, cb, tag=0, user_data=None, role="body",
+                   width=0, h=px(26)):
+            kw = {"tag": tag} if tag else {}
+            b = dpg.add_button(label=label, parent=L, height=h,
+                               width=width, user_data=user_data, callback=cb,
+                               pos=(C[key][0], y + (RH - h) // 2), **kw)
+            self.theme(b, theme)
+            self.font(b, role)
+            return b
+
+        def tick(y, color, h):
+            dpg.add_image("tex_white", parent=L, width=px(14), height=h,
+                          tint_color=color,
+                          pos=(C["tick"][0], y + (RH - h) // 2))
+
+        # 表頭
+        self.hrule(LOOK.PAPER_2, HH, width=W + px(11), parent=L, track=False,
+                   pos=(0, 0))
+        for key, label in (("a", "起"), ("b", "迄"), ("len", "實際刪"),
+                           ("snap", "吸附挪動")):
+            if key in C:
+                text(label, key, 0, "small", LOOK.INK_2, h=HH)
+        self.hrule(LOOK.PAPER_3, 1, width=W + px(11), parent=L, track=False,
+                   pos=(0, HH))
+        y = HH + 1
+
+        loaded = self.vtrack is not None
+        snap, rows = self.snapped()
+        if snap is None:
+            text("吸附失敗：%s" % rows, "a", y, "small")
+            y += RH + 1
+            rows = []
+        ih = lh + 2 * px(3)                          # 輸入框的高度
+        for i, cut in enumerate(self.cuts):
+            row = rows[i] if i < len(rows) else None
+            tick(y, LOOK.VERMILION, max(px(3), 2))
+            for side, key in ((0, "a"), (1, "b")):
+                # 顯示實際會刪的範圍（吸附之後），跟長度、刪除號、確認視窗一致；
+                # 改這格設定的是你標的點，存回去之後會再吸附一次
+                shown = cut[side] if row is None else row[2 + side]
+                t = dpg.add_input_text(default_value=fmt_time(shown, True),
+                                       parent=L, width=C[key][1] + px(8),
+                                       user_data=(i, side), on_enter=True,
+                                       callback=self.on_cut_edit,
+                                       pos=(C[key][0] - px(4),
+                                            y + (RH - ih) // 2))
+                self.theme(t, "cell")
+                self.font(t, "num")
+                with dpg.tooltip(t):
+                    dpg.add_text("實際從這裡切（已吸附到 fragment 邊界）。你標的是 %s。\n"
+                                 "可以直接改：打 195、3:15 或 1:02:03.5，按 Enter，"
+                                 "會再吸附一次。" % fmt_time(cut[side], True))
+            # 長度寫「實際會刪掉的」（吸附之後），跟刪除號、資訊欄、確認視窗同一個數
+            real = (row[3] - row[2]) if row is not None else (cut[1] - cut[0])
+            d = text("%.1f s" % real, "len", y)
+            if row is not None:
+                _, _, sa, sb = row
+                if "snap" in C:
+                    d = text("%s / %s" % (fmt_delta(sa - cut[0]),
+                                          fmt_delta(sb - cut[1])), "snap", y,
+                             color=LOOK.INK_2)
+                with dpg.tooltip(d):
+                    dpg.add_text("標的是 %.1f 秒，實際會刪 %s – %s（%.1f 秒）。\n"
+                                 "切點只能落在 fragment 邊界，所以起訖各挪了一點。"
+                                 % (cut[1] - cut[0], fmt_time(sa, True),
+                                    fmt_time(sb, True), sb - sa))
+            b = button("看", "look", y, "link", self.goto_cut, user_data=i)
+            with dpg.tooltip(b):
+                dpg.add_text("跳到這段前面，放大看接縫")
+            b = button("取消", "del", y, "link", self.del_cut, user_data=i)
+            with dpg.tooltip(b):
+                dpg.add_text("從清單拿掉這一段（還沒寫入，不會動到影片）")
+            y += RH
+            self.hrule(LOOK.PAPER_3, 1, width=W + px(11), parent=L,
+                       track=False, pos=(0, y))
+            y += 1
+
+        # 草稿列：正在標的這一段。I / O 是同一件事的快速鍵。
+        tick(y, LOOK.INK_3, 1)
+        for key, tag, empty, t, cb in (
+                ("a", "btn_mark_in", "設為起點  I", self.mark_in,
+                 self.set_mark_in),
+                ("b", "btn_mark_out", "設為終點  O", self.mark_out,
+                 self.set_mark_out)):
+            button(fmt_time(t, True) if t is not None else empty, key, y,
+                   "ghost_s", cb, tag=tag, width=C[key][1],
+                   role="num" if t is not None else "body")
+        if self.mark_in is not None and self.mark_out is not None:
+            text("%.1f s" % abs(self.mark_out - self.mark_in), "len", y)
+        button("加入", "look", y, "ink_s", self.add_cut_from_marks,
+               tag="btn_add_cut", width=C["look"][1] + px(8))
+        button("清除", "del", y, "link", self.clear_marks, tag="btn_clear_marks")
+        y += RH
+        dpg.add_spacer(parent=L, height=1, pos=(0, y))
+        if not loaded:
+            for tag in ("btn_mark_in", "btn_mark_out", "btn_add_cut",
+                        "btn_clear_marks"):
+                dpg.configure_item(tag, enabled=False)
+
+    def on_snap(self, value):
+        self.cfg["snap"] = "outer" if value == "外擴" else "inner"
         save_config(self.cfg)
         self.refresh_cuts_ui()
 
@@ -1385,8 +2333,8 @@ class App(object):
     # 播放
     # ======================================================================= #
 
-    def on_mode(self, sender, app_data):
-        self.preview_mode = "result" if app_data == "成品" else "source"
+    def on_mode(self, value):
+        self.preview_mode = "result" if value == "成品" else "source"
         was = self.player is not None and self.player.playing
         if self.player is not None:
             self.player.pause()
@@ -1462,17 +2410,18 @@ class App(object):
     # 時間軸
     # ======================================================================= #
 
+    # 由上而下的四條帶子（drawlist 內的 y 座標）
     @property
-    def tl_y_ruler(self):
-        return self.TL_PAD
+    def y_cells(self):
+        return self.TL_RULER
 
     @property
-    def tl_y_bar(self):
-        return self.TL_PAD + self.TL_H_RULER + self.TL_PAD
+    def y_band(self):
+        return self.TL_RULER + self.TL_CELLS
 
     @property
-    def tl_y_frag(self):
-        return self.tl_y_bar + self.TL_H_BAR + self.TL_PAD
+    def y_foot(self):
+        return self.TL_RULER + self.TL_CELLS + self.TL_BAND
 
     def t2x(self, t):
         span = max(self.view_b - self.view_a, 1e-6)
@@ -1506,9 +2455,26 @@ class App(object):
     def request_redraw(self):
         self._pending_redraw = True
 
+    def resize_all(self):
+        """視窗大小變了：滿版的線、欄位之間的直線、時間軸寬度、墨井。"""
+        try:
+            vw = dpg.get_viewport_client_width()
+            body_h = dpg.get_item_rect_size("lib_pane")[1]
+        except Exception:
+            return
+        for t in self._hrules:
+            if dpg.does_item_exist(t) and \
+                    dpg.get_item_configuration(t)["width"] != vw:
+                dpg.configure_item(t, width=vw)
+        for t in self._vrules:
+            if body_h > 0 and dpg.does_item_exist(t) and \
+                    dpg.get_item_configuration(t)["height"] != body_h:
+                dpg.configure_item(t, height=int(body_h))
+        self.resize_timeline()
+
     def resize_timeline(self):
         try:
-            w = dpg.get_item_rect_size("edit_pane")[0] - px(24)
+            w = dpg.get_item_rect_size("edit_pane")[0] - 2 * px(19)
         except Exception:
             return
         w = max(int(w), px(320))
@@ -1516,119 +2482,306 @@ class App(object):
             self.tl_w = w
             dpg.configure_item("timeline", width=w)
             self.request_redraw()
+            self._fill_cuts_table()       # 欄寬跟著編輯欄走
         self.fit_preview()
 
-    def redraw_timeline(self):
-        self._pending_redraw = False
-        if not dpg.does_item_exist("timeline"):
+    def _set_desc(self, desc, foot):
+        self._desc_full = desc
+        self._foot_text = foot
+
+    def _inner_w(self):
+        try:
+            return dpg.get_item_rect_size("edit_pane")[0] - 2 * px(19)
+        except Exception:
+            return 0
+
+    def _tick_transport(self):
+        """播放列放不下就拆成兩列：按鈕一列，原片／成品和時間碼一列。"""
+        inner = self._inner_w()
+        try:
+            a = dpg.get_item_rect_size("tp_a")[0]
+            seg = dpg.get_item_rect_size("tp_seg")[0]
+            clk = dpg.get_item_rect_size("tp_clock")[0]
+        except Exception:
             return
-        dpg.delete_item("timeline", children_only=True)
-        W = self.tl_w
-        yb, hb = self.tl_y_bar, self.TL_H_BAR
-        dpg.draw_rectangle((0, yb), (W, yb + hb), fill=C_BAR_BG,
-                           color=(28, 30, 34, 255), parent="timeline")
+        if inner <= 0 or a <= 0 or clk <= 0:
+            return
+        narrow = a + seg + clk + 3 * px(14) + px(10) > inner
+        if narrow != self._tp_narrow:
+            self._tp_narrow = narrow
+            dpg.move_item("tp_b", parent="tp_row2" if narrow else "tp_row1")
+            dpg.configure_item("tp_row2", show=narrow)
+
+    def _tick_desc(self):
+        """時間軸標題旁的說明：放不下就截短，不要撞到右邊的按鈕。"""
+        desc = getattr(self, "_desc_full", "")
+        try:
+            room = (self._inner_w() - dpg.get_item_rect_size("tl_h")[0]
+                    - dpg.get_item_rect_size("tlh_right")[0] - 3 * px(12))
+        except Exception:
+            return
+        if room <= 0:
+            return
+        text = desc if self.measure(desc, "small") <= room else \
+            self.wrap(desc, "small", room, 1)[0]
+        if dpg.get_value("tl_desc") != text:
+            dpg.set_value("tl_desc", text)
+
+    def redraw_timeline(self):
+        """
+        稿紙：上緣刻度、中間一格一個 fragment 的格子、下面一條標記帶、最下面說明。
+        要移除的段落把格子染成淡硃砂，上面畫一條帶回鉤的硃砂橫線（刪除號），
+        正中央寫「刪 52.0 s」。線永遠落在格線上 —— 切點只能在 fragment 邊界，
+        不用另外解釋。
+        """
+        self._pending_redraw = False
+        D = "timeline"
+        if not dpg.does_item_exist(D):
+            return
+        dpg.delete_item(D, children_only=True)
+        W, H = self.tl_w, self.TL_H
+        yc, yb, yf = self.y_cells, self.y_band, self.y_foot
+        dpg.draw_rectangle((0, 0), (W, H), fill=LOOK.PAPER, color=LOOK.PAPER,
+                           parent=D)
+
         if self.vtrack is None:
-            dpg.draw_text((px(8), yb + hb / 2 - px(8)), "還沒載入影片", size=px(14),
-                          color=(120, 126, 138, 255), parent="timeline")
+            self._set_desc("滾輪縮放 · 拖空白處平移 · 拖刪除號的兩端調整範圍",
+                           "切點只能落在格線上（fragment 邊界，約每 5 秒一格）")
+            dpg.draw_rectangle((0, yc), (W, yb), fill=LOOK.PAPER_2,
+                               color=LOOK.PAPER_2, parent=D)
+            t = dpg.draw_text((px(14), yc + (self.TL_CELLS - px(16)) / 2),
+                              "還沒載入影片", size=px(16), color=LOOK.INK_2,
+                              parent=D)
+            self.font(t, "small")
+            self._draw_frame(W, H)
             return
 
         snap, rows = self.snapped()
         snap = snap or []
 
-        # 保留的部分
+        # 格子的底色：留下的是紙的陰面，要刪的是淡硃砂
         for a, b in complement(snap, 0.0, self.duration):
             x0, x1 = self.t2x(a), self.t2x(b)
             if x1 < 0 or x0 > W:
                 continue
-            dpg.draw_rectangle((max(x0, 0), yb + 1), (min(x1, W), yb + hb - 1),
-                               fill=C_KEEP, color=C_KEEP, parent="timeline")
-
-        # 要移除的部分（吸附後的實際範圍）
+            dpg.draw_rectangle((max(x0, 0), yc), (min(x1, W), yb),
+                               fill=LOOK.PAPER_2, color=LOOK.PAPER_2, parent=D)
         for a, b in snap:
             x0, x1 = self.t2x(a), self.t2x(b)
             if x1 < 0 or x0 > W:
                 continue
-            dpg.draw_rectangle((max(x0, 0), yb + 1), (max(min(x1, W),
-                                                          max(x0, 0) + 2),
-                                                      yb + hb - 1),
-                               fill=C_CUT, color=C_CUT_EDGE, thickness=max(SCALE, 1.0),
-                               parent="timeline")
+            dpg.draw_rectangle((max(x0, 0), yc), (max(min(x1, W), x0 + 1), yb),
+                               fill=LOOK.VERMILION_PALE,
+                               color=LOOK.VERMILION_PALE, parent=D)
 
-        # 使用者要求的範圍（還沒吸附）畫成細框，看得出吸附差多少
+        self._draw_cells(yc, yb)
+        self._draw_ruler(0, yc)
+
+        # 標記帶：使用者原本標的範圍（吸附前），和正在標的起訖
         for a, b, sa, sb in rows or []:
             if abs(sa - a) < 1e-6 and abs(sb - b) < 1e-6:
                 continue
             x0, x1 = self.t2x(a), self.t2x(b)
-            if x1 < 0 or x0 > W:
+            if x1 < 0 or x0 > W or x1 - x0 < px(16):
                 continue
-            dpg.draw_rectangle((max(x0, 0), yb + 3), (min(x1, W), yb + hb - 3),
-                               color=C_ASK, thickness=max(SCALE, 1.0), parent="timeline")
-
-        self._draw_ruler()
-        self._draw_frag_strip()
-
-        # 標記
-        for t, lab in ((self.mark_in, "I"), (self.mark_out, "O")):
+            y = yb + px(7)
+            dpg.draw_line((x0, y), (x1, y), color=LOOK.INK_2, thickness=1,
+                          parent=D)
+            for x in (x0, x1):
+                dpg.draw_line((crisp(x), y), (crisp(x), y + px(5)),
+                              color=LOOK.INK_2, thickness=1, parent=D)
+        if self.mark_in is not None and self.mark_out is not None:
+            x0, x1 = sorted((self.t2x(self.mark_in), self.t2x(self.mark_out)))
+            y = yb + px(17)
+            dpg.draw_rectangle((x0, y), (x1, y + px(2)), fill=LOOK.INK,
+                               color=LOOK.INK, parent=D)
+        for t, lab in ((self.mark_in, "起"), (self.mark_out, "迄")):
             if t is None:
                 continue
             x = self.t2x(t)
             if -10 <= x <= W + 10:
-                dpg.draw_line((x, yb - 2), (x, yb + hb + 2), color=C_MARK,
-                              thickness=1.6 * SCALE, parent="timeline")
-                dpg.draw_text((x + px(2), yb - px(1)), lab, size=px(13), color=C_MARK,
-                              parent="timeline")
+                dpg.draw_line((crisp(x), yc), (crisp(x), yf), color=LOOK.INK,
+                              thickness=1, parent=D)
+                tt = dpg.draw_text((x + px(4), yb + px(3)), lab, size=px(16),
+                                   color=LOOK.INK, parent=D)
+                self.font(tt, "strong_s")
 
+        # 刪除號
+        last_label_end = -1e9
+        for i, (a, b) in enumerate(snap):
+            x0, x1 = self.t2x(a), self.t2x(b)
+            if x1 < 0 or x0 > W:
+                continue
+            self._draw_strike(i, x0, x1, b - a, yc)
+
+        # 播放頭：黑色細線，頂端一個小方塊壓在刻度帶底部。先畫它，
+        # 「刪 xx s」的紙色底才蓋得過去，字不會被線劃過
         x = self.t2x(self.playhead)
-        dpg.draw_line((x, self.tl_y_ruler), (x, yb + hb + self.TL_H_FRAG),
-                      color=C_PLAY, thickness=1.4 * SCALE, parent="timeline",
-                      tag="tl_playhead")
+        dpg.draw_rectangle((x - px(1), yc), (x + px(1), yf), fill=LOOK.INK,
+                           color=LOOK.INK, parent=D, tag="tl_playhead")
+        dpg.draw_rectangle((x - px(6), yc - px(8)), (x + px(6), yc),
+                           fill=LOOK.INK, color=LOOK.INK, parent=D,
+                           tag="tl_playhead_head")
 
-    def _draw_ruler(self):
-        W, y = self.tl_w, self.tl_y_ruler
+        for i, (a, b) in enumerate(snap):
+            x0, x1 = self.t2x(a), self.t2x(b)
+            if x1 < 0 or x0 > W:
+                continue
+            last_label_end = self._draw_strike_label(x0, x1, b - a, yc,
+                                                     last_label_end)
+
+        # 說明列（太長就截短，不要被框切掉一半）
+        y = yf + (self.TL_FOOT - px(16)) / 2.0
+        foot = self._foot_text
+        if self.measure(foot, "small") > W - px(20):
+            foot = self.wrap(foot, "small", W - px(20), 1)[0]
+        t = dpg.draw_text((px(10), y), foot, size=px(16),
+                          color=LOOK.INK_2, parent=D)
+        self.font(t, "small")
+
+        self._draw_frame(W, H)
+
+    def _draw_frame(self, W, H):
+        D = "timeline"
+        for y in (self.y_cells, self.y_foot):
+            dpg.draw_line((0, crisp(y)), (W, crisp(y)), color=LOOK.GRID,
+                          thickness=1, parent=D)
+        dpg.draw_rectangle((0.5, 0.5), (W - 0.5, H - 0.5), color=LOOK.GRID,
+                           thickness=1, parent=D)
+
+    def _draw_cells(self, y0, y1):
+        """一格一個 fragment。太擠就每 k 個畫一條，並在說明裡寫清楚一格是幾個。"""
+        D, W = "timeline", self.tl_w
+        b = self.bounds
+        lo = max(bisect_left(b, self.view_a) - 1, 0)
+        hi = min(bisect_right(b, self.view_b) + 1, len(b))
+        avg_s = (sum(self.vtrack.fragment_seconds())
+                 / max(len(self.vtrack.frags), 1))
+        per_px = avg_s / max(self.view_b - self.view_a, 1e-6) * W
+        k = 1
+        for k in (1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000):
+            if per_px * k >= px(CELL_MIN):
+                break
+        self._grid_k = k
+        snap_word = "外擴" if self.cfg["snap"] == "outer" else "內縮"
+        if k == 1:
+            self._set_desc("一格＝一個 fragment＝%.3f 秒 · 滾輪縮放 · 拖空白處平移"
+                           % avg_s,
+                           "切點只能落在格線上 · %s吸附 · 音訊精切 ±23 ms"
+                           % snap_word)
+        else:
+            self._set_desc("一格＝%d 個 fragment（約 %.0f 秒）· 滾輪放大到一格一個"
+                           % (k, avg_s * k),
+                           "切點只能落在 fragment 邊界 · 放大才看得到每一格 · "
+                           "%s吸附 · 音訊精切 ±23 ms" % snap_word)
+        start = lo - lo % k
+        for i in range(start, hi, k):
+            x = self.t2x(b[i])
+            if 0 < x < W:
+                dpg.draw_line((crisp(x), y0 + 1), (crisp(x), y1), parent=D,
+                              color=LOOK.GRID_SOFT, thickness=1)
+
+    def _draw_ruler(self, y0, y1):
+        D, W = "timeline", self.tl_w
         span = self.view_b - self.view_a
-        steps = (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200)
+        steps = sorted(RULER_MINOR)
+        fit = max(W / float(px(96)), 1.0)
         step = steps[-1]
         for s in steps:
-            if span / s <= 11:
+            if span / s <= fit:
                 step = s
                 break
-        t = (int(self.view_a / step)) * step
-        while t <= self.view_b:
+        minor = step / float(RULER_MINOR[step])
+        t = int(self.view_a / minor) * minor
+        n = 0
+        while t <= self.view_b + 1e-9 and n < 2000:
+            n += 1
             x = self.t2x(t)
             if 0 <= x <= W:
-                dpg.draw_line((x, y + px(12)), (x, y + px(17)), color=C_RULER,
-                              parent="timeline")
-                dpg.draw_text((x + px(3), y), fmt_time(t), size=px(13), color=C_RULER,
-                              parent="timeline")
-            t += step
+                major = abs(t / step - round(t / step)) < 1e-6
+                # 刻度從格子的上緣往上長、數字在最上面：播放頭的小方塊壓在
+                # 刻度帶底部，不會蓋到數字
+                h = px(8) if major else px(4)
+                dpg.draw_line((crisp(x), y1 - h), (crisp(x), y1),
+                              color=LOOK.INK_2 if major
+                              else LOOK.alpha(LOOK.INK_2, 120),
+                              thickness=1, parent=D)
+                if major:
+                    text = fmt_ruler(t)
+                    w = self.measure(text, "num_s")
+                    lx = min(max(x - w / 2.0, px(4)), W - w - px(4))
+                    tt = dpg.draw_text((lx, y0 + px(2)), text, size=px(16),
+                                       color=LOOK.INK_2, parent=D)
+                    self.font(tt, "num_s")
+            t += minor
 
-    def _draw_frag_strip(self):
-        """fragment 邊界 —— 視訊只能切在這些位置上。"""
-        W, y = self.tl_w, self.tl_y_frag
-        lo = bisect_left(self.bounds, self.view_a)
-        hi = bisect_right(self.bounds, self.view_b)
-        n = hi - lo
-        spacing = (self.t2x(self.bounds[lo + 1]) - self.t2x(self.bounds[lo])) \
-            if n > 1 else 0
-        if n > 1 and spacing >= px(4) and n <= 500:
-            for i in range(lo, hi):
-                x = self.t2x(self.bounds[i])
-                dpg.draw_line((x, y), (x, y + self.TL_H_FRAG), color=C_FRAG,
-                              parent="timeline")
-        else:
-            avg = (sum(self.vtrack.fragment_seconds())
-                   / max(len(self.vtrack.frags), 1))
-            dpg.draw_text((px(4), y),
-                          "fragment 約 %.1f s —— 放大才看得到切點邊界" % avg,
-                          size=px(12), color=(126, 132, 144, 255),
-                          parent="timeline")
+    def _draw_strike(self, i, x0, x1, secs, yc):
+        D = "timeline"
+        ym = yc + self.TL_CELLS * 0.5
+        th = max(px(3), 2)
+        x1 = max(x1, x0 + 2 * th)
+        hook = self.TL_CELLS * 0.42
+        if x1 - x0 < hook * 1.2:
+            # 全片看的時候一段廣告只有幾個像素寬，橫線加回鉤會擠成一個 H；
+            # 這時候直接塗成一塊硃砂，放大之後才畫成刪除號
+            dpg.draw_rectangle((x0, ym - hook / 2.0), (x1, ym + hook / 2.0),
+                               fill=LOOK.VERMILION, color=LOOK.VERMILION,
+                               parent=D)
+            return
+        dpg.draw_rectangle((x0, ym - th / 2.0), (x1, ym + th / 2.0),
+                           fill=LOOK.VERMILION, color=LOOK.VERMILION, parent=D)
+        for side, x in ((0, x0), (1, x1 - th)):
+            hot = self._hover == ("edge", i, side) or (
+                self._drag is not None and self._drag.get("kind") == "edge"
+                and self._drag.get("idx") == i and self._drag.get("side") == side)
+            col = LOOK.INK if hot else LOOK.VERMILION
+            w = th * 2 if hot else th
+            xx = x - (w - th) / 2.0
+            dpg.draw_rectangle((xx, ym - hook / 2.0), (xx + w, ym + hook / 2.0),
+                               fill=col, color=col, parent=D)
+
+    def _draw_strike_label(self, x0, x1, secs, yc, prev_end):
+        """「刪 52.0 s」：放在刪除號正上方，紙色底。跟前一個重疊就不畫。"""
+        D, W = "timeline", self.tl_w
+        num = " %.1f s" % secs
+        w1, w2 = self.measure("刪", "strong_s"), self.measure(num, "num_s")
+        tw = w1 + w2
+        pad = px(5)
+        lx = min(max((x0 + x1) / 2.0 - tw / 2.0, pad + 1), W - tw - pad - 1)
+        if lx - pad < prev_end + px(4):
+            return prev_end
+        ly = yc + px(2)
+        dpg.draw_rectangle((lx - pad, ly), (lx + tw + pad, ly + px(18)),
+                           fill=LOOK.PAPER, color=LOOK.PAPER, parent=D)
+        t = dpg.draw_text((lx, ly + px(1)), "刪", size=px(16),
+                          color=LOOK.VERMILION, parent=D)
+        self.font(t, "strong_s")
+        t = dpg.draw_text((lx + w1, ly + px(1)), num, size=px(16),
+                          color=LOOK.VERMILION, parent=D)
+        self.font(t, "num_s")
+        return lx + tw + pad
 
     def update_playhead(self):
         if dpg.does_item_exist("tl_playhead"):
             x = self.t2x(self.playhead)
-            yb, hb = self.tl_y_bar, self.TL_H_BAR
-            dpg.configure_item("tl_playhead", p1=(x, self.tl_y_ruler),
-                               p2=(x, yb + hb + self.TL_H_FRAG))
+            yc, yf = self.y_cells, self.y_foot
+            dpg.configure_item("tl_playhead", pmin=(x - px(1), yc),
+                               pmax=(x + px(1), yf))
+            dpg.configure_item("tl_playhead_head", pmin=(x - px(6), yc - px(8)),
+                               pmax=(x + px(6), yc))
+
+    def _tick_hover(self):
+        """滑到刪除號的兩端時把回鉤加粗變黑：那裡可以拖。"""
+        hover = None
+        if self._drag is None and self.vtrack is not None:
+            loc = self.tl_local()
+            if loc is not None and self.y_cells <= loc[1] <= self.y_band:
+                kind, idx, side = self.tl_hit(loc[0])
+                if kind == "edge":
+                    hover = ("edge", idx, side)
+        if hover != self._hover:
+            self._hover = hover
+            self.request_redraw()
 
     # ---- 滑鼠 ----
 
@@ -1774,8 +2927,14 @@ class App(object):
 
     def tick(self):
         self.pump()
-        self.resize_timeline()
+        self._tick_later()
+        self.resize_all()
+        self._tick_transport()
+        self._tick_desc()
+        self._tick_inspector()
+        self._tick_aligns()
         self.tick_drag()
+        self._tick_hover()
 
         frame = None
         if self.player is not None and self.player.playing:
@@ -1805,19 +2964,41 @@ class App(object):
         else:
             self.update_playhead()
 
-        if self.vtrack is not None:
-            if self.preview_mode == "result" and self.player is not None:
-                dpg.set_value("pos_label",
-                              "原片 %s / %s      成品 %s / %s"
-                              % (fmt_time(self.playhead, True),
-                                 fmt_time(self.duration),
-                                 fmt_time(self.player.source_to_output(
-                                     self.playhead), True),
-                                 fmt_time(self.player.total_playable())))
-            else:
-                dpg.set_value("pos_label", "%s / %s"
-                              % (fmt_time(self.playhead, True),
-                                 fmt_time(self.duration)))
+        self._sync_play_label()
+        self._tick_clock()
+
+    def _sync_play_label(self):
+        """
+        按鈕上的字跟著「現在到底有沒有在播」走，不靠每個地方記得去改。
+        以前只在按下去的那一刻改字：播著的時候換一支影片，舊的播放器被關掉了，
+        按鈕卻還寫著「暫停」，新的那支要按兩下字才對得上。
+        """
+        want = "暫停" if (self.player is not None and self.player.playing) \
+            else "播放"
+        if dpg.does_item_exist("btn_play") and \
+                dpg.get_item_label("btn_play") != want:
+            dpg.set_item_label("btn_play", want)
+
+    def _tick_clock(self):
+        """大字是播放位置；成品模式下是剪完之後的時間，後面註明原片在哪。"""
+        note = ""
+        if self.vtrack is None:
+            big, sub = "00:00:00", ""
+        elif self.preview_mode == "result" and self.player is not None:
+            out = self.player.source_to_output(self.playhead)
+            big = fmt_clock(out)
+            # 總長跟資訊欄的「新長」用同一種進位，不然會差一秒
+            sub = ".%d / %s" % (int((out % 1) * 10),
+                                fmt_dur(self.player.total_playable()))
+            note = "成品 · 原片在 %s" % fmt_time(self.playhead)
+        else:
+            big = fmt_clock(self.playhead)
+            sub = ".%d / %s" % (int((self.playhead % 1) * 10),
+                                fmt_dur(self.duration))
+        for tag, value in (("clock", big), ("clock_sub", sub),
+                           ("clock_note", note)):
+            if dpg.get_value(tag) != value:
+                dpg.set_value(tag, value)
 
     # ======================================================================= #
     # 寫入
@@ -1837,9 +3018,9 @@ class App(object):
             "影片：%s" % self.item.display_name,
             "手機路徑：%s" % self.item.device_path,
             "",
-            "要移除 %d 段，共 %s（原片 %s → 成品 %s）："
-            % (len(snap), fmt_time(total), fmt_time(self.duration),
-               fmt_time(self.duration - total)),
+            "要移除 %d 段，共 %.1f 秒（原片 %s → 成品 %s）："
+            % (len(snap), total, fmt_dur(self.duration),
+               fmt_dur(self.duration - total)),
         ]
         for i, (a, b) in enumerate(snap, 1):
             lines.append("    %d. %s - %s   （%.1f s）"
@@ -1853,6 +3034,7 @@ class App(object):
             " —— B站 不接受變小的檔案，會判定下載不完整而卡在「正在緩衝」。",
         ]
         dpg.set_value("confirm_text", "\n".join(lines))
+        self.center_window("win_confirm")
         dpg.show_item("win_confirm")
 
     def do_write(self):
@@ -1914,7 +3096,7 @@ class App(object):
                      % (drift, TRIM.human(v_info["tail_pad"]),
                         TRIM.human(a_info["tail_pad"])))
             if drift > 0.05:
-                self.log("⚠ 音畫差超過 50 ms，可能聽得出來不同步。")
+                self.log("警告：音畫差超過 50 ms，可能聽得出來不同步。")
 
             self.progress(0.6, "寫入本機")
             changed = TRIM.write_back(out, out / q_name, v_new, a_new,
@@ -2031,7 +3213,8 @@ class App(object):
             return
         self.cfg["backup_dir"] = str(Path(path))
         save_config(self.cfg)
-        dpg.set_value("backup_dir_label", self.cfg["backup_dir"])
+        self._sync_backup_label()
+        self.refresh_inspector()
         self.log("備份位置改成 %s" % self.cfg["backup_dir"])
 
     def open_backup_dir(self):
@@ -2051,6 +3234,7 @@ class App(object):
             self.log("打不開 %s：%s" % (p, e))
 
     def show_restore_window(self):
+        self.center_window("win_restore")
         dpg.show_item("win_restore")
         self.fill_restore_list()
 
@@ -2074,10 +3258,10 @@ class App(object):
                 dpg.add_text("    %s · %s · %s · cid %s"
                              % (b.created_at, fmt_time(b.duration_ms / 1000.0),
                                 fmt_bytes(b.total_bytes), b.cid),
-                             color=(146, 152, 164, 255))
+                             color=LOOK.INK_2)
         for p, why in bad:
-            dpg.add_text("✗ %s — %s" % (p.name, why), parent="restore_list",
-                         color=(226, 170, 90, 255), wrap=px(880))
+            dpg.add_text("讀不了：%s —— %s" % (p.name, why),
+                         parent="restore_list", color=LOOK.WARN, wrap=px(880))
 
     def on_restore_pick(self, sender, app_data, user_data):
         for i in range(len(self._restore_items)):
@@ -2118,7 +3302,7 @@ class App(object):
             except DEV.AdbError:
                 there = None
             if there is False:
-                lines.append("⚠ 手機上已經沒有這個目錄了。單純把檔案放回去，"
+                lines.append("注意：手機上已經沒有這個目錄了。單純把檔案放回去，"
                              "B站 的資料庫裡沒有這筆記錄，App 不會看到它 —— "
                              "要先在 App 裡重新下載這支影片。")
         dpg.set_value("restore_detail", "\n".join(lines))
@@ -2220,28 +3404,52 @@ class App(object):
     # 補字字型
     # ======================================================================= #
 
-    def apply_font(self):
+    def load_fonts(self, paths):
         """
-        用目前的字級重新載入字型並綁定。
+        依字型組（BF.resolve 的結果）和目前的字級，載入每個字型角色。
 
         舊的字型不刪：drawlist 裡用 draw_text 畫出來的文字會記住它建立當下
         綁的那個字型，事後把那個字型刪掉，下一次 render 就會踩到已經釋放的
         記憶體（實測是直接 segfault）。字型留著不礙事 —— Dear PyGui 2.x 的
         字形是用到才載入，而且一次工作階段也換不了幾次字級。
         """
-        size = px(BASE_FONT_PT)
-        for path in [p for p in (self.merged_font_path, self.base_font_path)
-                     if p]:
-            try:
-                with dpg.font_registry() as reg:
-                    f = dpg.add_font(str(path), size)
-                dpg.bind_font(f)
-            except Exception as e:
-                self.log("字型：%s 載入失敗（%s）" % (Path(path).name, e))
-                continue
-            self._font_regs.append(reg)
-            return path
-        return None
+        body = paths.get("body")
+        files = {
+            "body": body,
+            "strong": paths.get("strong") or body,
+            "serif": paths.get("serif") or paths.get("strong") or body,
+            # 影片標題什麼字都有：襯線體只在畫得出每個字時才用，見 refresh_inspector
+            "title": paths.get("serif") or body,
+            "num": paths.get("num") or body,
+            "numr": paths.get("numr") or paths.get("num") or body,
+        }
+        need_hints = _dpg_major() < 2
+        F = {}
+        with dpg.font_registry() as reg:
+            for role, (face, size_key) in LOOK.FONT_ROLES.items():
+                path = files.get(face)
+                if not path:
+                    continue
+                try:
+                    with dpg.font(str(path), px(LOOK.SIZES[size_key])) as f:
+                        if need_hints:
+                            for hint in ("mvFontRangeHint_Chinese_Full",
+                                         "mvFontRangeHint_Japanese",
+                                         "mvFontRangeHint_Default"):
+                                if hasattr(dpg, hint):
+                                    dpg.add_font_range_hint(getattr(dpg, hint))
+                    F[role] = f
+                except Exception as e:
+                    self.log("字型：%s 載入失敗（%s）" % (Path(path).name, e))
+        self._font_regs.append(reg)
+        for role in LOOK.FONT_ROLES:
+            if role not in F and "body" in F:
+                F[role] = F["body"]
+        self.F = F
+        self.font_files = files
+        self._wcache = {}
+        if "body" in F:
+            dpg.bind_font(F["body"])
 
     def on_font_size(self, sender, app_data):
         global UI_SCALE
@@ -2256,8 +3464,8 @@ class App(object):
 
     def rebuild_ui(self):
         """
-        字級變了要連版面一起重做（按鈕寬度、時間軸高度這些都是建立時就定死的，
-        不重建的話字變大就會被切掉）。狀態都在 self 上，所以重建完補回去就好。
+        字級或字型變了要連版面一起重做（按鈕寬度、時間軸高度、間距都是建立時
+        就定死的，不重建的話字變大就會被切掉）。狀態都在 self 上，重建完補回去。
         """
         was_playing = self.player is not None and self.player.playing
         if was_playing:
@@ -2266,34 +3474,38 @@ class App(object):
             if dpg.does_item_exist("lib_filter") else ""
 
         for tag in ("root", "dlg_backup_dir", "dlg_backup_file", "win_restore",
-                    "win_confirm", "win_help", "win_env", "preview_tex",
+                    "win_confirm", "win_help", "win_env", "win_log", "pop_dev",
+                    "pop_backup", "pop_settings", "pop_help", "preview_tex",
                     "tex_reg"):
             if dpg.does_item_exist(tag):
                 dpg.delete_item(tag)
+        for t in self.T.values():
+            if dpg.does_item_exist(t):
+                dpg.delete_item(t)
+        self._segs = {}
+        self._later = []
 
-        # 先換字型再建介面：drawlist 的文字會記住建立當下綁的字型，
-        # 順序反過來的話時間軸上的字會留在舊尺寸。
-        self.apply_font()
+        # 先換字型再建介面：drawlist 的文字會記住建立當下綁的字型
+        self.load_fonts(self.font_paths)
+        self.T = LOOK.make_themes(px)
+        dpg.bind_theme(self.T["global"])
         self._compute_metrics()
-        self._below_h = 0          # 版面換了，重新量一次預覽底下那疊的高度
+        self._below_h = 0          # 版面換了，重新量一次墨井底下那疊的高度
+        self._fit_key = None
         self.tl_w = px(1000)
         self.build()
 
         dpg.set_value("lib_filter", needle)
-        dpg.set_value("backup_dir_label", self.cfg["backup_dir"])
-        dpg.set_value("adb_state", self._adb_label)
-        dpg.configure_item("adb_state", color=self._adb_color)
+        self._sync_footer()
         for line in self.log_lines:
             self._emit_log(line)
-        self.rebuild_library()
-        self.show_selection()
+        self._fill_cuts_table()
 
         if self.src is not None:
             self.set_preview_texture(self.src.out_w, self.src.out_h)
         if self.vtrack is not None:
-            dpg.set_value("mode_radio",
-                          "成品" if self.preview_mode == "result" else "原片")
-            self.refresh_cuts_ui()
+            self.set_seg("mode",
+                         "成品" if self.preview_mode == "result" else "原片")
             self.request_redraw()
             if was_playing:
                 self.player.play(self.playhead)
@@ -2301,23 +3513,23 @@ class App(object):
             elif self.src is not None:
                 self.scrub.request(self.playhead)
         self.sync_enabled()
+        # 新字型要畫過一次才量得到字寬：清單和資訊欄晚兩格再排
+        self.later(self.rebuild_library)
+        self.later(self.refresh_cuts_ui)
 
-    def start_font_upgrade(self, base_path, size):
+    def start_font_upgrade(self):
         """
-        單一中文字型補不齊 B站 的標題（♡ ❤ ┊ ⌇、韓文、💓 這些都缺），
-        缺的字 Dear PyGui 會畫成「?」。所以背景把韓文與符號從別的系統字型
-        合併進來，好了再換上去 —— 介面照樣先用底字型開起來，不卡啟動。
+        介面的字型組（Noto 的固定字重、Bahnschrift 的等寬數字、補過字的內文）
+        第一次要在背景做大約一分鐘。setup.py 平常已經先做好了，這裡是給
+        沒跑 setup 的人的保險。做好就重建介面換上去。
         """
-        if not base_path:
-            return
-        ready = BF.cached(base_path)
-        if ready:
-            self.apply_merged_font(ready, size)
+        pending = self.font_paths.get("pending") or []
+        if not pending:
             return
         problem = BF.fonttools_problem()
         if problem is not None:
-            self.log("提醒：標題裡的 ♡ ❤ 韓文、表情符號這個字型沒有，會顯示成"
-                     "「?」。要自動補起來需要 fonttools，但它現在不能用：")
+            self.log("提醒：介面字型和標題裡的 ♡ ❤ 韓文、表情需要 fonttools 才做得"
+                     "出來，但它現在不能用：")
             self.log("      %s" % problem)
             self.log('      裝法（用這個直譯器，別直接打 pip）：'
                      '"%s" -m pip install fonttools' % sys.executable)
@@ -2326,29 +3538,20 @@ class App(object):
             return
 
         def body():
-            self.log("字型：正在補齊缺字（韓文與符號），只有第一次要做，"
-                     "大約半分鐘。這期間標題可能先顯示成「?」。")
-            try:
-                path = BF.build(base_path, log=self.log)
-            except BF.FontError as e:
-                self.log("字型：補字失敗（%s）。標題裡的 ♡ ❤ 韓文、表情會顯示"
-                         "成「?」，其他功能不受影響。" % e)
-                return
-            self.post(lambda: self.apply_merged_font(path, size))
+            self.log("字型：第一次要準備介面字型（約一分鐘），這段時間先用系統字型。")
+            res = BF.resolve(make=True, log=self.log)
+            self.post(lambda: self.on_fonts_built(res))
 
-        threading.Thread(target=body, name="font-merge", daemon=True).start()
+        threading.Thread(target=body, name="font-build", daemon=True).start()
 
-    def apply_merged_font(self, path, size=None):
-        """（主執行緒）換上補好字的字型。size 保留只為相容舊呼叫。"""
-        before = self.merged_font_path
-        self.merged_font_path = Path(path)
-        if self.apply_font() is None:
-            self.merged_font_path = before
-            self.log("字型：載入 %s 失敗，繼續用原本的。" % Path(path).name)
+    def on_fonts_built(self, res):
+        keys = ("body", "strong", "serif", "num", "numr")
+        same = all(str(res.get(k)) == str(self.font_paths.get(k)) for k in keys)
+        self.font_paths = res
+        if same:
             return
-        self.log("字型：已套用補字版 %s" % Path(path).name)
-        if self.items:
-            self.rebuild_library()
+        self.log("字型：介面字型準備好了，換上去。")
+        self.rebuild_ui()
 
     def window_size(self):
         """
@@ -2378,11 +3581,15 @@ class App(object):
         global UI_SCALE
         UI_SCALE = self.cfg.get("font_pt", BASE_FONT_PT) / float(BASE_FONT_PT)
         dpg.create_context()
-        font, fpath = pick_font(px(BASE_FONT_PT))
-        self.base_font_path = fpath
+        # 一張 1x1 的白圖：所有細線都是它染色拉長的（重建介面時不刪）
+        with dpg.texture_registry(tag="ui_tex"):
+            dpg.add_static_texture(1, 1, [1.0, 1.0, 1.0, 1.0], tag="tex_white")
+        self.font_paths = BF.resolve(make=False)
+        self.load_fonts(self.font_paths)
+        self.T = LOOK.make_themes(px)
+        dpg.bind_theme(self.T["global"])
         self.build()
-        if font is not None:
-            dpg.bind_font(font)
+        self._fill_cuts_table()
         with dpg.handler_registry():
             dpg.add_mouse_down_handler(callback=self.on_mouse_down)
             dpg.add_mouse_release_handler(callback=self.on_mouse_release)
@@ -2393,15 +3600,21 @@ class App(object):
         # 見 WINDOW_TITLE 的註解：非 ASCII 的標題會讓第一次 render 直接 segfault，
         # 所以這裡再擋一次，免得將來有人改成中文又踩到。
         title = WINDOW_TITLE if WINDOW_TITLE.isascii() else "bili-trim"
+        icon = str(ICON_PATH) if ICON_PATH.is_file() else ""
         dpg.create_viewport(title=title, width=int(w), height=int(h),
-                            min_width=px(1100), min_height=px(700))
+                            min_width=px(1180), min_height=px(700),
+                            small_icon=icon, large_icon=icon)
+        dpg.set_viewport_clear_color(LOOK.PAPER)
         dpg.setup_dearpygui()
         dpg.show_viewport()
-        if font is None:
+        if not self.font_files.get("body"):
             self.log("找不到中文字型，介面上的中文會顯示不出來。")
         else:
-            self.log("字型：%s（%d pt）" % (fpath, px(BASE_FONT_PT)))
-        self.start_font_upgrade(fpath, px(BASE_FONT_PT))
+            self.log("字型：%s（%d pt）" % (Path(self.font_files["body"]).name,
+                                          px(BASE_FONT_PT)))
+        self.start_font_upgrade()
+        self.later(self.refresh_inspector)
+        self.later(self.rebuild_library)
         self.startup()
 
         try:
@@ -2491,12 +3704,15 @@ def font_report():
         print("  用這個直譯器安裝（別直接打 pip，那可能是另一個 Python）：")
         print('      "%s" -m pip install fonttools' % sys.executable)
 
-    base = None
-    for p in FONT_CANDIDATES:
-        if os.path.isfile(p):
-            base = p
-            break
-    print("底字型   : %s" % (base or "找不到任何中文字型！"))
+    res = BF.resolve(make=False)
+    for role, label in (("body", "內文"), ("strong", "粗體"), ("serif", "標題"),
+                        ("num", "數字")):
+        print("%-8s : %s" % (label, res[role] or "（沒有，用內文代替）"))
+    if res["pending"]:
+        print("還沒做好 : %s —— 下次開 GUI 會在背景做（約一分鐘），"
+              "或現在跑 python bili_font.py" % "、".join(res["pending"]))
+    base = BF.face_ready("body") or BF.base_font()
+    print("補字的底 : %s" % (base or "找不到任何中文字型！"))
     if base is None:
         return 1
 
