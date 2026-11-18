@@ -1,4 +1,9 @@
-# bili-trim
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo-light.png" alt="bili-trim" width="440">
+  </picture>
+</p>
 
 把 B站 Android 緩存影片裡的工商片段剪掉，**剪完還是在 B站 App 裡播** ——
 播放器、彈幕、進度記憶全部照舊。
@@ -18,7 +23,10 @@ bili_trim.py    剪輯引擎 + 命令列版本（純標準庫，不需要 ffmpeg
 bili_device.py  adb：找裝置、找 B站 路徑、列緩存、拉取／推送
 bili_backup.py  單檔備份（.bilibak）與還原
 bili_media.py   預覽用的影格來源與播放器（ffmpeg / ffplay）
-bili_font.py    把系統字型合併成一個不缺字的字型檔
+bili_font.py    準備介面字型：固定 Noto 的字重、把缺的字合併進內文字型
+bili_look.py    介面的樣子：稿紙的顏色、字級、主題（換主題只改這裡）
+fonts/          介面數字用的 Barlow Semi Condensed（SIL OFL 1.1，見 fonts/OFL.txt）
+assets/         圖示、字標、GitHub 分享圖；都是 assets/make_icon.py 畫的
 bili_env.py     找 adb / ffmpeg（先看 tools/，再看 PATH）與環境自我檢查
 bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 ```
@@ -95,7 +103,7 @@ bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 3. 第一次會問要不要裝三個 Python 套件，按 Enter 就好
 4. 程式開起來。少了 `adb` 或 `ffmpeg` 的話，它會自己跳出**環境檢查**視窗，
    列出缺什麼、去哪裡下載、放到哪個資料夾，旁邊就是按鈕
-5. 手機接上電腦、開「USB 偵錯」，按**重新掃描**
+5. 手機接上電腦、開「USB 偵錯」，按左下角的**重新掃描手機**
 
 沒有 Python 的話，第 2 步會告訴你去裝；裝完再點一次同一個檔案。
 （`winget install -e --id Python.Python.3.12`，或到
@@ -131,7 +139,7 @@ python setup.py
 | --- | --- |
 | Python 套件 | 裝到「現在跑的這個」直譯器 |
 | 外部工具 | **問過你之後**才從官方來源下載，放進 `tools/` |
-| 字型 | 先把韓文與符號合併進中文字型（約半分鐘），省得第一次開程式時等 |
+| 字型 | 先把介面字型準備好（約一分鐘），省得第一次開程式時等 |
 | 啟動方式 | 把它用的那個 Python 記進 `python-path.txt`，啟動檔會優先讀它 |
 | 設定 | 問備份位置、建好資料夾、寫進設定檔 |
 | 手機 | 等你把 USB 偵錯打開並授權，然後找 B站 的緩存目錄、列一次影片 |
@@ -150,6 +158,32 @@ python.org 版、conda…）。套件裝在哪一個就要用哪一個開，不�
 不下載、`--skip-font` 不建字型、`--backup-dir PATH` 直接指定備份位置、
 `--pack` 打包（見下一節）。
 
+### 做成一個 exe（對方不用裝 Python）
+
+```bash
+python setup.py --exe
+```
+
+用 PyInstaller 把 Python、介面套件、字型整個封成 `dist\bili-trim.exe`（約 50 MB），
+第一次會問要不要裝 PyInstaller。拿到 exe 的人：
+
+1. 把 `bili-trim.exe` 放到任何自己的資料夾（不要放 `Program Files`）
+2. adb 和 ffmpeg 一樣要自己準備：已經在 PATH 裡就不用管；沒有的話在 exe 旁邊
+   建一個 `tools` 資料夾，放法跟上面那張表一樣
+3. 點兩下 `bili-trim.exe`
+
+幾件要知道的事：
+
+- **adb 和 ffmpeg 不會封進 exe。** 理由跟 `--pack` 那段一樣（授權不同）。
+- **從手機拉下來的暫存放在 exe 旁邊**的 `bili_gui_stage`；設定和字型快取跟原始碼版
+  共用 `%APPDATA%\bili_trim_gui\`，兩個版本可以輪流用。
+- **第一次開會比較慢**：exe 要先把自己解開（每次幾秒），在新電腦上還要準備介面字型
+  （約一分鐘，在背景做）。
+- **Windows 可能會擋。** exe 沒有數位簽章，SmartScreen 會跳「Windows 已保護您的電腦」，
+  按「其他資訊 → 仍要執行」。有些防毒軟體也會對 PyInstaller 做的 exe 過度敏感。
+- 開不起來的話會跳一個訊息框，完整的錯誤記錄在
+  `%APPDATA%\bili_trim_gui\bili-trim-error.log`。
+
 ### 帶去另一台電腦
 
 ```bash
@@ -165,9 +199,10 @@ python setup.py --pack
 
 ### 出問題的時候
 
-程式裡：**說明 → 環境檢查**。逐項列出 Python、三個套件、
-adb／ffmpeg／ffplay／ffprobe、合併字型、備份位置，缺的東西下面就是下載
-連結和「開啟 tools 資料夾」按鈕。按**把結果寫進訊息區**可以複製整段貼出來。
+程式裡：右上角**說明 → 環境檢查**。逐項列出 Python、三個套件、
+adb／ffmpeg／ffplay／ffprobe、介面字型、備份位置，缺的東西下面就是下載
+連結和「開啟 tools 資料夾」按鈕。按**把結果寫進訊息**會打開訊息視窗，
+那裡的**全部複製**可以整段貼出來。
 
 命令列：
 
@@ -191,10 +226,24 @@ B站 的標題什麼字都有：繁中、簡中、假名、韓文，還有 `♡ 
 Android 顯示得出來是因為系統有字型後備鏈，但 Dear PyGui 一次只綁一個字型檔，
 缺的字會畫成 `?` —— 而且掃過本機所有大字型，涵蓋最好的也還缺 7 個字。
 
-所以會把韓文與符號從其他系統字型子集化之後**合併成一個字型檔**（約半分鐘，
-之後快取起來不用再做）。第一次開程式它會在背景自己建；`setup.py` 會先做好。
-這需要 `fonttools`，沒裝也能跑，只是那些字會顯示成 `?`。合併結果放在
-`%APPDATA%\bili_trim_gui\fonts\`。
+所以會把缺的字從其他系統字型子集化之後**合併成一個字型檔**，之後快取起來
+不用再做。介面用三套字，兩套是 Windows 11 內建的，數字那套專案自己帶著：
+
+| | 字型 | 用在 |
+| --- | --- | --- |
+| 內文 | Noto Sans TC | 清單、說明、按鈕 |
+| 標題 | Noto Serif TC | 區塊標題、資訊欄裡的影片標題 |
+| 數字 | Barlow Semi Condensed（專案的 `fonts/` 裡） | 時間碼、刻度、位元組（等寬數字，播放時不會抖） |
+
+要先加工一次：Noto 是可變字型，直接給 Dear PyGui 會畫成最細的 Thin，所以
+用 fontTools 固定成需要的粗細；Windows 版的 Noto Sans TC 只收繁體字，
+簡體字（们、说、这…）和日文漢字從微軟正黑體補進來；Barlow 的數字預設
+是比例寬，改用它自己的等寬數字字形。全部約一分鐘，第一次開程式會在背景做（這段
+時間先用系統字型），`setup.py` 會先做好。
+
+Windows 10 沒有 Noto，會退回微軟正黑體，功能完全一樣。
+這需要 `fonttools`，沒裝也能跑，只是補不到的字會顯示成 `?`。
+做好的字型放在 `%APPDATA%\bili_trim_gui\fonts\`。
 
 還是看到 `?` 的話，跑這個會告訴你卡在哪裡 —— 用的是哪個 Python、補字字型
 建好了沒、以及手機上每一筆標題還缺哪些字元：
@@ -211,18 +260,25 @@ bili-trim.bat --check-font
 
 點兩下 `bili-trim.bat`（或 `python run.py`）。
 
-1. 接上手機，按**重新掃描** —— 會自己找 B站 的緩存目錄、列出所有影片
-2. 選一支，按**載入以編輯**（從手機拉到本機暫存，之後重用不必再拉）
+畫面是三欄：左邊是手機上的快取，中間是畫面和時間軸，右邊是「這一支」的資料
+和寫入按鈕。
+
+1. 接上手機，按左下角**重新掃描手機** —— 會自己找 B站 的緩存目錄、列出所有影片
+2. 選一支，右邊按**載入以編輯**（從手機拉到本機暫存，之後重用不必再拉）
 3. 拖時間軸找廣告：滾輪縮放、拖空白處平移、點一下跳到該處，
-   `I` / `O` 設起訖點，**加入移除區間**
-4. 切到**成品**模式按播放 —— 播到接縫會直接跳過被移除的段落，
+   `I` / `O` 設起訖點（或按區間表最下面那列的按鈕），再按**加入**
+4. 時間軸上的格子就是 fragment：要移除的段落會畫上一條硃砂紅的刪除號，
+   切點只會落在格線上
+5. 切到**成品**模式按播放 —— 播到接縫會直接跳過被移除的段落，
    聽得出來接得乾不乾淨
-5. 微調：拖紅塊邊緣，或在下面的清單裡直接打時間
-6. **寫入手機** —— 會先強制備份，然後推回去並在裝置上重算 md5 核對
+6. 微調：拖刪除號的兩端，或在區間表裡直接改時間
+7. 右邊的**備份並寫入手機** —— 會先強制備份，然後推回去並在裝置上重算 md5 核對
+
+底下那一列是最新一則訊息；完整的紀錄按右下角**訊息**打開（出錯時會自己打開）。
 
 快速鍵：`空白鍵` 播放／暫停、`I` 設起點、`O` 設終點、`←` `→` 單格移動、`Home` 回開頭。
 
-**設定**選單裡可以調：音量、音訊延遲、預覽畫質、**介面字級**（小／標準／大／
+右上角**設定**裡可以調：音量、音訊延遲、預覽畫質、**介面字級**（小／標準／大／
 特大／超大）。字級改了會連按鈕、欄位、時間軸一起放大，不會只有字變大然後被
 切掉；選取的影片、剪輯區間、播放位置都會保留。設定記在
 `%APPDATA%\bili_trim_gui\settings.json`。
@@ -310,4 +366,8 @@ payload/<type_tag>/audio.m4s
 
 ## 授權
 
-MIT，見 [LICENSE](LICENSE)。
+程式碼是 MIT，見 [LICENSE](LICENSE)。
+
+`fonts/` 裡的 Barlow Semi Condensed 是 The Barlow Project Authors 的作品，
+以 SIL Open Font License 1.1 授權（見 [fonts/OFL.txt](fonts/OFL.txt)），
+原檔照 Google Fonts 發佈的樣子放著，沒有修改。

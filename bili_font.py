@@ -31,7 +31,7 @@ import sys
 import time
 from pathlib import Path
 
-RANGES_VERSION = 1          # 改動下面的範圍時要加一，快取才會失效
+RANGES_VERSION = 2          # 改動下面的範圍時要加一，快取才會失效
 
 
 def _r(a, b):
@@ -51,15 +51,28 @@ SYMBOLS = (_r(0x2190, 0x21FF) + _r(0x2200, 0x22FF) + _r(0x2300, 0x23FF) +
 EMOJI = (_r(0x1F300, 0x1F5FF) + _r(0x1F600, 0x1F64F) +
          _r(0x1F680, 0x1F6FF) + _r(0x1F900, 0x1F9FF))
 
+# 漢字與假名：介面的內文是 Google Fonts 版的 Noto Sans TC，它只收繁體會用到的字 ——
+# 實測 GB2312 的 6763 個簡體字缺 1898 個（们说这为时书…），日文的 歩桜気図 也缺。
+# B站 的標題大半是簡體，所以從微軟正黑／雅黑把缺的漢字補進來。
+CJK = (_r(0x2E80, 0x2FDF) + _r(0x3000, 0x30FF) + _r(0x3400, 0x4DBF) +
+       _r(0x4E00, 0x9FFF) + _r(0xF900, 0xFAFF) + _r(0xFF00, 0xFFEF))
+
 # 補字來源，依序嘗試；同一個字碼先被前面的字型補到就不再找後面的
 FALLBACKS = (
+    ("msjh.ttc", CJK),                      # 微軟正黑體（底字型不是它時才有用）
+    ("msyh.ttc", CJK),                      # 微軟雅黑
     ("seguisym.ttf", SYMBOLS + EMOJI),      # Segoe UI Symbol
     ("malgun.ttf", HANGUL),                 # Malgun Gothic
     ("gulim.ttc", HANGUL),                  # 舊版 Windows 的韓文字型
     ("seguiemj.ttf", EMOJI),                # Segoe UI Emoji（慢，最後才用）
 )
 
-FONT_DIRS = ("C:/Windows/Fonts", "/System/Library/Fonts",
+# 專案自己帶的字型（Barlow Semi Condensed，OFL）。放最前面：它不是系統字型，
+# 但每台電腦都一樣，介面的數字長得才一致。
+# exe 版的 fonts/ 封在 exe 裡，PyInstaller 執行時解到 sys._MEIPASS
+BUNDLED_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "fonts"
+
+FONT_DIRS = (str(BUNDLED_DIR), "C:/Windows/Fonts", "/System/Library/Fonts",
              "/usr/share/fonts/truetype", str(Path.home() / ".fonts"))
 
 # 底字型候選，依序試。放在這裡而不是 GUI 裡，是因為 setup.py 也要用，
@@ -134,8 +147,18 @@ def cache_dir():
 
 
 def _stamp(path):
-    st = Path(path).stat()
-    return "%s:%d:%d" % (Path(path).name, st.st_size, int(st.st_mtime))
+    path = Path(path)
+    st = path.stat()
+    try:
+        bundled = path.resolve().parent == BUNDLED_DIR.resolve()
+    except OSError:
+        bundled = False
+    if bundled:
+        # 專案自帶的字型：exe 版每次啟動都重新解壓，修改時間每次都不一樣，
+        # 用它當快取鍵會讓字型每次開都重做一遍。這幾個檔案很小，直接看內容。
+        digest = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+        return "%s:%d:%s" % (path.name, st.st_size, digest)
+    return "%s:%d:%d" % (path.name, st.st_size, int(st.st_mtime))
 
 
 def plan(base_path):
@@ -236,6 +259,11 @@ def build(base_path, log=None, force=False):
             s = subset.Subsetter(options=opts)
             s.populate(unicodes=want)
             s.subset(f)
+            # 合併要求每個字型的 unitsPerEm 一樣：Noto 是 1000，Windows 的
+            # 補字來源都是 2048，不換算的話 fontTools 直接拒絕合併。
+            if f["head"].unitsPerEm != base["head"].unitsPerEm:
+                from fontTools.ttLib.scaleUpem import scale_upem
+                scale_upem(f, base["head"].unitsPerEm)
             piece = work / ("fb%d.ttf" % n)
             f.save(str(piece))
             pieces.append(piece)
@@ -279,14 +307,273 @@ def build(base_path, log=None, force=False):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _prune(keep):
-    """清掉舊的合併結果，只留現在這一個。"""
-    try:
-        for p in keep.parent.glob("merged-*.ttf"):
-            if p != keep:
+def _prune(keep, pattern="merged-*.ttf"):
+    """清掉舊的產物，只留現在這一個。刪不掉的（被防毒軟體或別的程式開著）跳過，下次再清。"""
+    for p in keep.parent.glob(pattern):
+        if p != keep:
+            try:
                 p.unlink()
-    except OSError:
-        pass
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# 介面的字型組
+# --------------------------------------------------------------------------- #
+#
+# 介面用四種字：內文（Noto Sans TC）、粗體（同一套的 Bold）、標題（Noto Serif TC）、
+# 數字（Barlow Semi Condensed，專案的 fonts/ 裡帶著；沒有的話退回 Windows 的
+# Bahnschrift 半窄體）。
+#
+# Windows 11 內建的 Noto 是可變字型，預設實例是 Thin / ExtraLight —— Dear PyGui
+# 不認可變字型的軸，直接載入就是一整片細線。所以先用 fontTools 把需要的粗細
+# 「固定」成一般字型檔，快取起來。每個只要幾秒，而且只有第一次要做。
+#
+# 數字一定要等寬，不然時間碼在播放時會左右抖。Dear PyGui 不跑 OpenType 功能：
+# 字型有 tnum 就把它的字形直接寫進 cmap（Bahnschrift）；沒有 tnum 的（Google Fonts
+# 版的 Barlow 就沒有）把 0–9 的字寬拉成一樣、字形置中。改的是快取裡那一份，
+# fonts/ 裡的原檔不動。
+#
+# 找不到這些字型（Windows 10、macOS、Linux）就退回原本的底字型，介面照樣能用。
+
+FACES_VERSION = 1
+
+FACES = {
+    # 角色: (候選 [(檔名, 軸座標)]（依序找第一個有的）, 等寬數字)
+    "body": ((("NotoSansTC-VF.ttf", {"wght": 400}),), False),
+    "strong": ((("NotoSansTC-VF.ttf", {"wght": 700}),), False),
+    "serif": ((("NotoSerifTC-VF.ttf", {"wght": 600}),), False),
+    "num": ((("BarlowSemiCondensed-SemiBold.ttf", {}),
+             ("bahnschrift.ttf", {"wght": 600, "wdth": 87.5})), True),
+    # 資訊欄的數值跟中文內文排在一起，要同一個粗細（一般體）
+    "numr": ((("BarlowSemiCondensed-Regular.ttf", {}),
+              ("bahnschrift.ttf", {"wght": 400, "wdth": 87.5})), True),
+}
+
+# 沒有 Noto 的時候，粗體退回這些（不必加工就能用）
+STRONG_FALLBACKS = ("C:/Windows/Fonts/msjhbd.ttc", "C:/Windows/Fonts/msyhbd.ttc")
+
+
+def face_source(role):
+    """(來源檔, 軸座標, 等寬數字)；這台電腦一個候選都沒有就回 None。"""
+    candidates, tnum = FACES[role]
+    for name, loc in candidates:
+        p = find_font(name)
+        if p is not None:
+            return p, loc, tnum
+    return None
+
+
+def face_path(role):
+    """加工後的快取檔路徑（不管存不存在）；沒有來源字型就回 None。"""
+    src = face_source(role)
+    if src is None:
+        return None
+    path, loc, tnum = src
+    key = "|".join([_stamp(path), "v%d" % FACES_VERSION, "tnum" if tnum else "",
+                    ",".join("%s=%s" % kv for kv in sorted(loc.items()))])
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:10]
+    return cache_dir() / ("face-%s-%s.ttf" % (role, digest))
+
+
+def face_ready(role):
+    p = face_path(role)
+    if p is not None and p.is_file() and p.stat().st_size > 0:
+        return p
+    return None
+
+
+def _bake_tnum(font):
+    """把 GSUB 裡 tnum 的單一替換直接寫進 cmap。回傳換了幾個字。"""
+    if "GSUB" not in font:
+        return 0
+    table = font["GSUB"].table
+    lookups = set()
+    for rec in table.FeatureList.FeatureRecord:
+        if rec.FeatureTag == "tnum":
+            lookups.update(rec.Feature.LookupListIndex)
+    mapping = {}
+    for i in sorted(lookups):
+        lk = table.LookupList.Lookup[i]
+        for st in lk.SubTable:
+            if lk.LookupType == 7:            # extension 包了一層
+                st = st.ExtSubTable
+            m = getattr(st, "mapping", None)
+            if m:
+                mapping.update(m)
+    n = 0
+    for sub in font["cmap"].tables:
+        for cp, g in list(sub.cmap.items()):
+            if g in mapping:
+                sub.cmap[cp] = mapping[g]
+                n += 1
+    return n
+
+
+def _force_tabular(font, chars="0123456789"):
+    """沒有 tnum 的字型：把數字的字寬拉成最寬那一個，字形左右置中。"""
+    if "glyf" not in font:
+        return 0
+    cmap = font.getBestCmap()
+    hm, glyf = font["hmtx"], font["glyf"]
+    names = [cmap[ord(c)] for c in chars if ord(c) in cmap]
+    if not names:
+        return 0
+    target = max(hm[n][0] for n in names)
+    for n in names:
+        adv, lsb = hm[n]
+        d = (target - adv) // 2
+        g = glyf[n]
+        if d:
+            if g.isComposite():
+                for c in g.components:
+                    c.x += d
+            elif g.numberOfContours > 0:
+                g.coordinates.translate((d, 0))
+            g.recalcBounds(glyf)
+        hm[n] = (target, lsb + d)
+    return len(names)
+
+
+def make_face(role, log=None):
+    """把可變字型固定成需要的粗細，存進快取，回傳路徑。失敗丟 FontError。"""
+    out = face_path(role)
+    if out is None:
+        raise FontError("這台電腦沒有 %s 需要的字型。" % role)
+    if out.is_file() and out.stat().st_size > 0:
+        return out
+    if not have_fonttools():
+        raise FontError("沒有安裝 fonttools，沒辦法調字重（pip install fonttools）。")
+    import logging
+    from fontTools.ttLib import TTFont
+    from fontTools.varLib import instancer
+
+    logging.getLogger("fontTools").setLevel(logging.ERROR)
+    path, loc, tnum = face_source(role)
+    t0 = time.perf_counter()
+    if log:
+        log("字型：從 %s 做出 %s%s" % (
+            path.name, role, "（%s）" % ", ".join("%s %s" % kv for kv in loc.items())
+            if loc else ""))
+    try:
+        f = TTFont(str(path))
+        if "fvar" in f:
+            axes = {a.axisTag for a in f["fvar"].axes}
+            instancer.instantiateVariableFont(
+                f, {k: v for k, v in loc.items() if k in axes}, inplace=True,
+                updateFontNames=False)
+        if tnum and not _bake_tnum(f):
+            _force_tabular(f)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".part")
+        f.save(str(tmp))
+        tmp.replace(out)
+    except Exception as e:
+        raise FontError("做 %s 字型失敗（%s：%s）"
+                        % (role, type(e).__name__, str(e)[:200]))
+    _prune(out, "face-%s-*.ttf" % role)
+    if log:
+        log("字型：%s 好了（%.1f MB，%.0f 秒）"
+            % (out.name, out.stat().st_size / 1e6, time.perf_counter() - t0))
+    return out
+
+
+def resolve(make=False, log=None):
+    """
+    介面要用的字型檔，回傳 dict：
+
+        body    內文（補過字的版本優先）     strong  粗體
+        serif   標題（沒有就是 None）        num     數字（沒有就是 None）
+        pending 還有沒做好的（make=False 時才會有東西）
+
+    make=True 會把缺的做出來（第一次大約一分鐘，給背景執行緒或 setup.py 用）。
+    任何一步失敗都只是退回下一個選擇，不丟例外。
+    """
+    def say(msg):
+        if log:
+            log(msg)
+
+    can = have_fonttools()
+    got, pending = {}, []
+    for role in FACES:
+        p = face_ready(role)
+        if p is None and face_source(role) is not None:
+            if make and can:
+                try:
+                    p = make_face(role, say)
+                except FontError as e:
+                    say("字型：%s" % e)
+            else:
+                pending.append(role)
+        got[role] = p
+
+    # 內文：Noto（固定好的）優先，沒有就用原本的底字型；兩者都要再補字
+    base = got["body"] or base_font()
+    body = None
+    if base is not None:
+        body = cached(base)
+        if body is None and plan(base)[0] is not None:
+            if make and can:
+                try:
+                    body = build(base, log=say)
+                except FontError as e:
+                    say("字型：%s" % e)
+            else:
+                pending.append("merge")
+        body = body or Path(base)
+
+    strong = got["strong"]
+    if strong is None:
+        strong = next((Path(p) for p in STRONG_FALLBACKS if os.path.isfile(p)),
+                      body)
+    return {"body": body, "strong": strong, "serif": got["serif"],
+            "num": got["num"], "numr": got["numr"], "pending": pending}
+
+
+_COVERAGE = {}
+_BASELINE = {}
+
+
+def baseline(path):
+    """
+    基線離行頂多遠（以 Dear PyGui 的字級為 1）。Dear PyGui 依 ascent - descent
+    縮放字型，所以兩套字同樣標 17，基線位置和字的大小都不一樣；
+    要排在同一行就得用這個對齊。讀不出來就回 None。
+    """
+    key = str(path)
+    if key not in _BASELINE:
+        try:
+            from fontTools.ttLib import TTFont
+            f = TTFont(key, fontNumber=0, lazy=True)
+            hh = f["hhea"]
+            _BASELINE[key] = hh.ascent / float(hh.ascent - hh.descent)
+        except Exception:
+            _BASELINE[key] = None
+    return _BASELINE[key]
+
+
+def coverage(path):
+    """字型 cmap 涵蓋的字碼（快取）。讀不出來就回 None。"""
+    key = str(path)
+    if key not in _COVERAGE:
+        try:
+            from fontTools.ttLib import TTFont
+            f = TTFont(key, fontNumber=0, lazy=True)
+            cps = set()
+            for sub in f["cmap"].tables:
+                cps |= set(sub.cmap.keys())
+            _COVERAGE[key] = cps
+        except Exception:
+            _COVERAGE[key] = None
+    return _COVERAGE[key]
+
+
+def covers(path, text):
+    """path 這個字型畫得出 text 的每一個字嗎？判斷不了就當作不行。"""
+    cps = coverage(path) if path else None
+    if not cps:
+        return False
+    return all(ord(ch) in cps or ch in " \t" for ch in text or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -319,5 +606,24 @@ def clean_text(text):
 
 
 if __name__ == "__main__":
-    base = sys.argv[1] if len(sys.argv) > 1 else "C:/Windows/Fonts/msjh.ttc"
-    print(build(base, log=print, force="--force" in sys.argv))
+    # python bili_font.py           把介面的字型組全部做好（setup.py 用這個）
+    # python bili_font.py <字型檔>  只把那個字型拿去補字（除錯用）
+    # --force                       重做
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    force = "--force" in sys.argv
+    if args:
+        print(build(args[0], log=print, force=force))
+        sys.exit(0)
+    if force:
+        base = face_ready("body") or base_font()
+        old = cached(base) if base else None
+        if old is not None:
+            old.unlink()
+        for role in FACES:
+            p = face_ready(role)
+            if p is not None:
+                p.unlink()
+    res = resolve(make=True, log=print)
+    for role in ("body", "strong", "serif", "num"):
+        print("%-7s %s" % (role, res[role] or "（沒有，用內文代替）"))
+    sys.exit(0 if res["body"] is not None else 1)
