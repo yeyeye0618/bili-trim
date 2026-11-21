@@ -29,6 +29,7 @@ fonts/          介面數字用的 Barlow Semi Condensed（SIL OFL 1.1，見 fon
 assets/         圖示、字標、GitHub 分享圖；都是 assets/make_icon.py 畫的
 bili_env.py     找 adb / ffmpeg（先看 AppData 的 tools，再看 PATH）、從下載好的 zip 裝工具、環境自我檢查
 bili_drop.py    讓檔案總管裡的檔案可以拖進視窗（Windows）
+bili_filedlg.py 「選擇檔案」用 Windows 原生的開啟視窗（跟檔案總管同一個）
 bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 ```
 
@@ -258,6 +259,15 @@ python setup.py --pack
 程式裡：右上角**說明 → 環境檢查**。視窗只講缺什麼、怎麼補；按
 **把詳細結果寫進訊息**會逐項列出 Python、三個套件、adb／ffmpeg／ffplay／ffprobe
 在哪裡、介面字型、備份位置，訊息視窗的**全部複製**可以整段貼出來。
+
+**手機接上了卻找不到**：程式會自己分出是哪一種，跳出視窗講下一步。
+
+| 視窗說 | 原因 | 怎麼辦 |
+| --- | --- | --- |
+| 還沒開「USB 偵錯」 | 手機只用「傳輸檔案」接著 | 照視窗的三步打開開發人員選項和 USB 偵錯 |
+| 手機在問：允許 USB 偵錯嗎？ | 等你在手機上按 | 按「允許」；沒看到就按「再問一次」 |
+| Windows 還少一個設定 | Windows 用內建的 WinUSB 接上了 adb 介面，但手機沒附上 adb 找它用的介面 GUID（vivo 等） | 按「補上設定」：Windows 會問要不要允許，它只替這個介面補上 `DeviceInterfaceGUIDs`，不裝任何東西 |
+| 沒有這支手機的 adb 驅動程式 | adb 介面完全沒有驅動 | 按「下載驅動程式」裝 Google USB Driver |
 
 命令列：
 

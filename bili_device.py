@@ -130,26 +130,328 @@ def check_adb():
     return True, "%s（%s）" % (ver, exe)
 
 
-def list_devices():
-    """回傳 [Device, ...]，只含狀態為 device 的。"""
+# adb devices 第二欄：手機接上了，但還在等人在手機上按「允許 USB 偵錯」
+WAITING = ("unauthorized", "authorizing")
+
+
+def device_states():
+    """[(序號, 狀態, 型號)]。狀態就是 adb devices 的第二欄：device / unauthorized / offline …"""
     out = _run(["devices", "-l"], timeout=30)
-    found = []
+    rows = []
     for line in out.splitlines()[1:]:
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split()
+        parts = line.strip().split()
         if len(parts) < 2:
-            continue
-        serial, state = parts[0], parts[1]
-        if state != "device":
             continue
         model = ""
         for p in parts[2:]:
             if p.startswith("model:"):
                 model = p[6:].replace("_", " ")
-        found.append(Device(serial, model))
-    return found
+        rows.append((parts[0], parts[1], model))
+    return rows
+
+
+def list_devices():
+    """回傳 [Device, ...]，只含狀態為 device（可以用）的。"""
+    return [Device(serial, model) for serial, state, model in device_states()
+            if state == "device"]
+
+
+def waiting_devices():
+    """接上了、但手機還沒按「允許 USB 偵錯」的序號。"""
+    return [serial for serial, state, _ in device_states() if state in WAITING]
+
+
+# --------------------------------------------------------------------------- #
+# Windows：adb 看不到手機的時候，看 Windows 自己看到什麼
+# --------------------------------------------------------------------------- #
+#
+# adb 只回答「看得到 / 看不到」。看不到的原因有三種，使用者要做的事完全不同：
+#
+#   1. USB 偵錯沒開         手機只以「傳輸檔案」（MTP）出現，根本沒有 adb 介面
+#   2. adb 介面在，但找不到  Windows 用內建的 WinUSB 驅動接上了 adb 介面，可是手機
+#                           沒附上 adb 認得的介面 GUID（vivo 等手機常見）。
+#                           補上 DeviceInterfaceGUIDs 這個設定、重啟介面就好 →「補上設定」
+#   3. adb 介面沒有驅動      要裝 Google USB Driver（或手機廠商的驅動）
+#
+# 全部直接問 SetupAPI，幾毫秒，可以放在每 2 秒一次的檢查裡。
+
+# adb（AdbWinApi）用來找手機的介面 GUID；Google USB Driver 的 inf 寫的就是它
+ADB_IFACE_GUID = "{F72FE0D4-CBCB-407d-8814-9ED673D0DD6B}"
+_WPD_IFACE_GUID = "{6AC27878-A6FA-4155-BA85-F98F491D4F33}"
+# USB 介面描述的 class / subclass / protocol：ff/42/01 就是 adb
+_ADB_COMPAT = "class_ff&subclass_42&prot_01"
+
+
+def usb_phones():
+    r"""
+    用「傳輸檔案」（MTP）接著的 USB 裝置路徑（\\?\usb#vid_2d95&pid_6002#…），沒有就 []。
+    adb 看不到、這裡又有東西，多半就是 USB 偵錯沒開。
+    """
+    if os.name != "nt":
+        return []
+    try:
+        return [p for p in _iface_paths(_WPD_IFACE_GUID)
+                if p.lower().startswith("\\\\?\\usb#")]
+    except Exception:
+        return []
+
+
+def adb_usb_problems():
+    """
+    接著、而且是 adb 介面（ff/42/01），但 adb 找不到的 USB 介面。
+    回傳 [(裝置實例 ID, 驅動服務名稱)]：服務是 "WINUSB" 的可以「補上設定」，
+    空字串表示沒有驅動。
+    """
+    if os.name != "nt":
+        return []
+    try:
+        seen = set(p.lower() for p in _iface_paths(ADB_IFACE_GUID))
+        out = []
+        for inst, compat, service in _usb_devices():
+            if not any(_ADB_COMPAT in c.lower() for c in compat):
+                continue
+            # 介面路徑是實例 ID 把 \ 換成 #：\\?\usb#vid_..&mi_01#6&...#{guid}
+            key = "\\\\?\\" + inst.replace("\\", "#").lower() + "#"
+            if any(p.startswith(key) for p in seen):
+                continue
+            out.append((inst, service.upper()))
+        return out
+    except Exception:
+        return []
+
+
+# 實例 ID 只會有這些字元；要放進以系統管理員身分執行的指令，多驗一次
+_SAFE_INST = re.compile(r"^USB\\[A-Za-z0-9_&.\\-]+$")
+
+
+def fix_adb_usb(instance_ids, log=lambda s: None):
+    """
+    幫 adb 介面補上 DeviceInterfaceGUIDs、重啟介面。要系統管理員權限，
+    Windows 會跳出「是否允許這個 App 變更你的裝置？」。
+    回傳 (成功, 給使用者看的一句話)。
+
+    只動這幾個介面在登錄檔裡的 Device Parameters（Google USB Driver 的 inf 裝好後
+    寫的也是同一個值），不裝任何驅動、不改其他設定。
+    """
+    ids = [i for i in instance_ids if _SAFE_INST.match(i)]
+    if not ids:
+        return False, "找不到要修的 USB 介面。"
+    lines = ["$ErrorActionPreference = 'Stop'", "$rc = 0"]
+    for i in ids:
+        lines.append(
+            "New-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Enum\\%s"
+            "\\Device Parameters' -Name DeviceInterfaceGUIDs "
+            "-PropertyType MultiString -Value '%s' -Force | Out-Null"
+            % (i, ADB_IFACE_GUID))
+    for i in ids:
+        lines.append("pnputil /restart-device '%s' | Out-Null; "
+                     "if ($LASTEXITCODE -ne 0) { $rc = 3 }" % i)
+    lines.append("exit $rc")
+    rc = _run_elevated_powershell("\n".join(lines))
+    if rc is None:
+        return False, "沒有補上：Windows 問要不要允許的時候按了「否」。"
+    if rc == 0:
+        return True, "補好了。"
+    if rc == 3:
+        return True, "設定補上了，但 Windows 沒辦法自己重新接上：把手機的線拔掉再插一次。"
+    return False, "沒補上（結束碼 %s）。可以改裝 Google USB Driver。" % rc
+
+
+def _run_elevated_powershell(script):
+    """以系統管理員身分跑一段 PowerShell，等它結束。回傳結束碼；使用者按「否」回 None。"""
+    import base64
+    import ctypes
+    from ctypes import wintypes
+
+    class SEI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HWND), ("lpVerb", ctypes.c_wchar_p),
+                    ("lpFile", ctypes.c_wchar_p),
+                    ("lpParameters", ctypes.c_wchar_p),
+                    ("lpDirectory", ctypes.c_wchar_p), ("nShow", ctypes.c_int),
+                    ("hInstApp", ctypes.c_void_p), ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", ctypes.c_wchar_p), ("hkeyClass", ctypes.c_void_p),
+                    ("dwHotKey", wintypes.DWORD), ("hIcon", ctypes.c_void_p),
+                    ("hProcess", ctypes.c_void_p)]
+
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    sei = SEI()
+    sei.cbSize = ctypes.sizeof(sei)
+    sei.fMask = 0x40 | 0x400            # NOCLOSEPROCESS | FLAG_NO_UI
+    sei.lpVerb = "runas"
+    sei.lpFile = "powershell.exe"
+    sei.lpParameters = ("-NoProfile -NonInteractive -ExecutionPolicy Bypass "
+                        "-WindowStyle Hidden -EncodedCommand " + encoded)
+    sei.nShow = 0
+    shell32 = ctypes.windll.shell32
+    shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(SEI)]
+    if not shell32.ShellExecuteExW(ctypes.byref(sei)):
+        if ctypes.GetLastError() == 1223:       # ERROR_CANCELLED：按了「否」
+            return None
+        raise OSError("ShellExecuteEx 失敗（%d）" % ctypes.GetLastError())
+    k32 = ctypes.windll.kernel32
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p,
+                                       ctypes.POINTER(wintypes.DWORD)]
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    try:
+        k32.WaitForSingleObject(sei.hProcess, 120000)
+        code = wintypes.DWORD()
+        k32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+        return code.value
+    finally:
+        k32.CloseHandle(sei.hProcess)
+
+
+def _setupapi():
+    import ctypes
+    from ctypes import wintypes
+
+    class GUID(ctypes.Structure):
+        _fields_ = [("a", ctypes.c_uint32), ("b", ctypes.c_uint16),
+                    ("c", ctypes.c_uint16), ("d", ctypes.c_ubyte * 8)]
+
+    api = ctypes.windll.setupapi
+    api.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+    api.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                         ctypes.c_void_p, wintypes.DWORD]
+    api.SetupDiEnumDeviceInterfaces.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.c_void_p]
+    api.SetupDiGetDeviceInterfaceDetailW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    api.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p, wintypes.DWORD,
+                                          ctypes.c_void_p]
+    api.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p,
+        ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    api.SetupDiGetDeviceInstanceIdW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD)]
+    api.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+    return ctypes, wintypes, api, GUID
+
+
+def _iface_paths(iface_guid):
+    """現在接著、登記成 iface_guid 這種介面的裝置路徑。"""
+    ctypes, wintypes, api, GUID = _setupapi()
+
+    class IfaceData(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("guid", GUID),
+                    ("flags", wintypes.DWORD), ("reserved", ctypes.c_void_p)]
+
+    g = GUID()
+    ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(iface_guid),
+                                        ctypes.byref(g))
+    # DIGCF_PRESENT | DIGCF_DEVICEINTERFACE：只要現在接著的
+    h = api.SetupDiGetClassDevsW(ctypes.byref(g), None, None, 0x12)
+    if not h or h == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            d = IfaceData()
+            d.cbSize = ctypes.sizeof(d)
+            if not api.SetupDiEnumDeviceInterfaces(h, None, ctypes.byref(g), i,
+                                                   ctypes.byref(d)):
+                break
+            i += 1
+            need = wintypes.DWORD()
+            api.SetupDiGetDeviceInterfaceDetailW(h, ctypes.byref(d), None, 0,
+                                                 ctypes.byref(need), None)
+            if need.value < 8:
+                continue
+            buf = ctypes.create_string_buffer(need.value)
+            # SP_DEVICE_INTERFACE_DETAIL_DATA_W.cbSize：64 位元是 8、32 位元是 6
+            ctypes.c_uint32.from_buffer(buf).value = \
+                8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 6
+            if api.SetupDiGetDeviceInterfaceDetailW(h, ctypes.byref(d), buf, need,
+                                                    None, None):
+                out.append(ctypes.wstring_at(ctypes.addressof(buf) + 4))
+    finally:
+        api.SetupDiDestroyDeviceInfoList(h)
+    return out
+
+
+def _usb_devices():
+    """現在接著的 USB 裝置：[(實例 ID, [相容 ID…], 驅動服務名稱)]。"""
+    ctypes, wintypes, api, GUID = _setupapi()
+
+    class DevInfo(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("guid", GUID),
+                    ("devinst", wintypes.DWORD), ("reserved", ctypes.c_void_p)]
+
+    def prop(h, d, key):
+        need = wintypes.DWORD()
+        api.SetupDiGetDeviceRegistryPropertyW(h, ctypes.byref(d), key, None,
+                                              None, 0, ctypes.byref(need))
+        if not need.value:
+            return []
+        buf = ctypes.create_unicode_buffer(need.value // 2 + 2)
+        if not api.SetupDiGetDeviceRegistryPropertyW(
+                h, ctypes.byref(d), key, None, buf, need.value + 4, None):
+            return []
+        raw = ctypes.wstring_at(ctypes.addressof(buf), need.value // 2)
+        return [x for x in raw.split("\0") if x]
+
+    # DIGCF_PRESENT | DIGCF_ALLCLASSES，只列 USB 匯流排上的
+    h = api.SetupDiGetClassDevsW(None, "USB", None, 0x2 | 0x4)
+    if not h or h == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            d = DevInfo()
+            d.cbSize = ctypes.sizeof(d)
+            if not api.SetupDiEnumDeviceInfo(h, i, ctypes.byref(d)):
+                break
+            i += 1
+            buf = ctypes.create_unicode_buffer(512)
+            if not api.SetupDiGetDeviceInstanceIdW(h, ctypes.byref(d), buf, 512,
+                                                   None):
+                continue
+            compat = prop(h, d, 2)          # SPDRP_COMPATIBLEIDS
+            service = (prop(h, d, 4) or [""])[0]    # SPDRP_SERVICE
+            out.append((buf.value, compat, service))
+    finally:
+        api.SetupDiDestroyDeviceInfoList(h)
+    return out
+
+
+def usb_diagnosis(rows):
+    """
+    adb 沒有可用的手機時，說得出原因的話是哪一種：
+        ("waiting", [])    手機在問「允許 USB 偵錯嗎？」
+        ("driver", ids)    adb 介面在，Windows 少了設定 → fix_adb_usb(ids) 修得好
+        ("nodriver", ids)  adb 介面沒有驅動
+        ("off", [])        只有「傳輸檔案」，USB 偵錯沒開
+        (None, [])         看不出來（沒接、或只接著充電）
+    rows 是 device_states() 的結果。
+    """
+    if any(state in WAITING for _, state, _ in rows):
+        return "waiting", []
+    probs = adb_usb_problems()
+    fix = [inst for inst, service in probs if service == "WINUSB"]
+    if fix:
+        return "driver", fix
+    if probs:
+        return "nodriver", [inst for inst, _ in probs]
+    if usb_phones():
+        return "off", []
+    return None, []
+
+
+def ask_again():
+    """
+    讓手機再跳一次「允許 USB 偵錯嗎？」。那個問題是 adb 連上手機時觸發的，
+    使用者按掉（或沒看到就逾時）之後不會自己再問；把 adb 的背景服務重開，
+    它重新連上的時候手機就會再問一次。
+    """
+    _run_any(["kill-server"], 15)
+    _run_any(["start-server"], 30)
 
 
 # --------------------------------------------------------------------------- #
