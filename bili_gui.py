@@ -42,6 +42,7 @@ import bili_config as CFG
 import bili_device as DEV
 import bili_env as ENV
 import bili_drop as DROP
+import bili_filedlg as FD
 import bili_font as BF
 import bili_look as LOOK
 import bili_media as MED
@@ -352,6 +353,16 @@ class App(object):
         self._ff_label = ""
         self._env_note_val = ("", False, None)   # 環境檢查視窗底下那行字
         self._installing = False
+        self._picking = False       # Windows 的開啟視窗開著
+        # 沒有手機時每 2 秒看一下 adb（_tick_watch）：上次看到的可用／等允許的序號
+        self._watch_t = 0.0
+        self._watching = False
+        self._watch_ready = None
+        # 手機用 USB 接著、但還不能用的原因："off" 還沒開 USB 偵錯；
+        # "waiting" 手機在問「允許 USB 偵錯嗎？」；None 沒這回事
+        self._usb_state = None
+        self._usb_fix_ids = []      # "driver" 的時候要修的 USB 介面
+        self._hwnd = None           # 主視窗的 HWND（開啟視窗要掛在它底下）
         self._stage_note = ""
         self.ui_q = queue.Queue()
         self.busy = False
@@ -787,7 +798,11 @@ class App(object):
         dev = self.device
         if dpg.does_item_exist("chip_dev"):
             if dev is None:
-                label = "沒有連線的手機"
+                label = {"off": "手機還沒開 USB 偵錯",
+                         "waiting": "等手機按「允許」",
+                         "driver": "Windows 還少一個設定",
+                         "nodriver": "缺手機的驅動程式"}.get(self._usb_state,
+                                                         "沒有連線的手機")
             elif dev.wireless:
                 label = dev.label.replace("（", " · ").rstrip("）")
             else:
@@ -837,7 +852,7 @@ class App(object):
             dpg.add_menu_item(label="還原備份…", callback=self.show_restore_window)
             dpg.add_menu_item(label="開啟備份資料夾", callback=self.open_backup_dir)
             dpg.add_menu_item(label="變更備份位置…",
-                              callback=lambda: dpg.show_item("dlg_backup_dir"))
+                              callback=self.pick_backup_dir)
         with dpg.popup("bar_settings", mousebutton=left, tag="pop_settings",
                        min_size=(px(300), px(20))):
             dpg.add_slider_int(label="音量", default_value=self.cfg["volume"],
@@ -1677,12 +1692,10 @@ class App(object):
             dpg.add_file_extension(BK.EXT, color=LOOK.OK)
             dpg.add_file_extension(".*")
 
+        # 上面這幾個 Dear PyGui 檔案視窗只在叫不出 Windows 開啟視窗時才用
+        # （不是 Windows），見 pick_path
         with dpg.file_dialog(directory_selector=False, show=False, modal=True,
                              tag="dlg_tool_zip", width=px(760), height=px(460),
-                             # 只是起始位置：沒有「下載」資料夾就從預設的地方開
-                             default_path=next((str(d) for d in
-                                                [Path.home() / "Downloads"]
-                                                if d.is_dir()), ""),
                              callback=lambda s_, a_: self.install_tools(
                                  [a_.get("file_path_name")])):
             dpg.add_file_extension(".zip", color=LOOK.OK)
@@ -1693,7 +1706,7 @@ class App(object):
             with dpg.group(horizontal=True):
                 dpg.add_text("", tag="restore_dir_label", wrap=px(700))
                 dpg.add_button(label="瀏覽其他檔案…",
-                               callback=lambda: dpg.show_item("dlg_backup_file"))
+                               callback=self.pick_backup_file)
                 dpg.add_button(label="重新整理", callback=self.fill_restore_list)
             dpg.add_separator()
             with dpg.child_window(height=px(-104), tag="restore_list"):
@@ -1738,6 +1751,28 @@ class App(object):
                                callback=self.log_env_check)
                 dpg.add_button(label="關閉", width=px(96),
                                callback=lambda: dpg.hide_item("win_env"))
+
+        with dpg.window(label="USB 偵錯", tag="win_usb", show=False,
+                        modal=True, width=px(660), height=px(290)):
+            self.font(dpg.add_text("", tag="usb_title"), "strong")
+            dpg.add_spacer(height=px(4))
+            dpg.add_text("", tag="usb_body", wrap=px(620))
+            self.font(dpg.add_text("", tag="usb_hint", wrap=px(620),
+                                   color=LOOK.INK_2), "small")
+            dpg.add_spacer(height=px(8))
+            with dpg.group(horizontal=True):
+                b = dpg.add_button(label="補上設定", tag="btn_usb_fix", width=px(130),
+                                   callback=self.usb_fix)
+                self.theme(b, "write")
+                dpg.add_button(label="下載驅動程式", tag="btn_usb_driver",
+                               width=px(160), callback=lambda: self.open_url(
+                                   "https://developer.android.com/studio/run/win-usb"))
+                dpg.add_button(label="再問一次", tag="btn_usb_again", width=px(130),
+                               callback=self.usb_ask_again)
+                dpg.add_button(label="關閉", width=px(96),
+                               callback=lambda: dpg.hide_item("win_usb"))
+            self.font(dpg.add_text("", tag="usb_note", wrap=px(620),
+                                   color=LOOK.INK_2), "small")
 
         with dpg.window(label="用 Wi-Fi 連線", tag="win_wifi", show=False,
                         modal=True, width=px(820), height=px(720)):
@@ -1973,7 +2008,7 @@ class App(object):
                                    callback=lambda s_, a_, u: self.open_url(
                                        u, note=True))
                 dpg.add_button(label="選擇檔案…", width=px(130),
-                               callback=lambda: dpg.show_item("dlg_tool_zip"))
+                               callback=self.pick_tool_zip)
         dpg.add_spacer(height=px(6), parent=P)
         self.font(dpg.add_text("", tag="env_note", parent=P, wrap=px(640),
                                color=LOOK.INK_2), "small")
@@ -2060,6 +2095,10 @@ class App(object):
                 self._reconnect_wifi(hosts)
             devs = DEV.list_devices()
             if not devs:
+                state, ids = DEV.usb_diagnosis(DEV.device_states())
+                if state:
+                    self.log(self.USB_LOG[state])
+                    return ("usb", state, ids)
                 # 還沒接手機是正常狀態，不是錯誤：不要因此跳出訊息視窗，
                 # 左邊清單會寫下一步怎麼做
                 self.log("還沒看到手機：接上 USB 並開啟「USB 偵錯」，或用頂端裝置"
@@ -2095,12 +2134,12 @@ class App(object):
             return devs, dev, roots, items
 
         def done(res):
-            if res is None:
+            if res is None or res[0] == "usb":
                 self.devices, self.device, self.roots, self.items = [], None, [], []
-                self._sync_device_ui()
-                self.rebuild_library()
+                self.set_usb_state(*(res[1:] if res else (None,)))
                 self.progress(0.0, "")
                 return
+            self.set_usb_state(None)
             devs, dev, roots, items = res
             self.devices, self.device, self.roots, self.items = \
                 devs, dev, roots, items
@@ -2118,6 +2157,161 @@ class App(object):
             self.progress(0.0, "")
 
         self.run_worker("掃描", work, done)
+
+    USB_LOG = {
+        "off": "手機用 USB 接著，但還沒開「USB 偵錯」—— adb 看不到它。",
+        "waiting": "手機接上了，正在問「允許 USB 偵錯嗎？」—— 在手機上按「允許」。",
+        "driver": "手機開了 USB 偵錯，但 Windows 少了讓 adb 找到它的設定 —— 按「補上設定」。",
+        "nodriver": "手機開了 USB 偵錯，但 Windows 沒有它的 adb 驅動程式。",
+    }
+    USB_TEXT = {
+        "off": (
+            "手機接上了，但還沒開「USB 偵錯」",
+            "1. 手機：設定 → 關於手機 → 連點「版本號碼」7 次，打開開發人員選項\n"
+            "2. 設定 → 開發人員選項 → 打開「USB 偵錯」\n"
+            "3. 手機會問「允許 USB 偵錯嗎？」，按「允許」",
+            "每家手機的選單名稱不太一樣（vivo 在「系統管理」裡），找不到就在設定裡"
+            "搜尋「USB 偵錯」。開好之後這裡會自己繼續。"),
+        "waiting": (
+            "手機在問：允許 USB 偵錯嗎？",
+            "在手機上勾「一律允許這部電腦」，再按「允許」。按好之後這裡會自己繼續。",
+            "沒看到這個問題：先把手機螢幕解鎖；還是沒有就按「再問一次」。"),
+        "driver": (
+            "USB 偵錯開了，但 Windows 還少一個設定",
+            "Windows 已經接上手機的 adb 介面，但少了一個讓 adb 找得到它的設定"
+            "（vivo 等手機常見）。按「補上設定」，Windows 會先問你是否允許。",
+            "只改這支手機這個 USB 介面的一個設定，不會安裝任何東西。"
+            "補好之後手機會問「允許 USB 偵錯嗎？」。"),
+        "nodriver": (
+            "USB 偵錯開了，但 Windows 沒有這支手機的 adb 驅動程式",
+            "按「下載驅動程式」，照頁面上的步驟安裝 Google USB Driver"
+            "（或手機廠商的驅動程式）。裝好之後把手機拔掉再插一次。",
+            "裝好之後這裡會自己繼續。"),
+    }
+
+    def set_usb_state(self, state, ids=()):
+        """
+        手機用 USB 接著、但還不能用的原因（見 DEV.usb_diagnosis），或 None。
+        狀態變了才跳視窗 —— 使用者關掉之後，同一個狀態不會一直跳回來。
+        """
+        old, self._usb_state = self._usb_state, state
+        self._usb_fix_ids = list(ids) if state == "driver" else []
+        self._sync_device_ui()
+        self.rebuild_library()
+        if not dpg.does_item_exist("win_usb"):
+            return
+        if state is None:
+            dpg.hide_item("win_usb")
+            return
+        title, body, hint = self.USB_TEXT[state]
+        dpg.set_value("usb_title", title)
+        dpg.set_value("usb_body", body)
+        dpg.set_value("usb_hint", hint)
+        dpg.configure_item("btn_usb_again", show=state == "waiting")
+        dpg.configure_item("btn_usb_fix", show=state == "driver", enabled=True)
+        dpg.configure_item("btn_usb_driver", show=state == "nodriver")
+        if state != old:
+            dpg.set_value("usb_note", "")
+            if not dpg.is_item_shown("win_env"):     # 還在補工具就先別擋
+                self.center_window("win_usb")
+                dpg.show_item("win_usb")
+
+    def usb_fix(self):
+        """補上 adb 介面的設定（要系統管理員），補好就重開 adb，讓手機來問「允許」。"""
+        ids = list(self._usb_fix_ids)
+        if not ids:
+            return
+        dpg.set_value("usb_note", "Windows 會問「是否允許這個 App 變更你的裝置？」，按「是」。")
+        dpg.configure_item("btn_usb_fix", enabled=False)
+        self._watching = True
+
+        def body():
+            try:
+                ok, msg = DEV.fix_adb_usb(ids)
+                if ok:
+                    time.sleep(2)           # 等 Windows 把介面重新接上
+                    DEV.ask_again()         # 重開 adb：它重新找手機時，手機就會問
+            except Exception as e:
+                ok, msg = False, "沒補上：%s" % e
+
+            def done():
+                self._watching = False
+                self._watch_t = 0.0
+                self.log(msg)
+                if dpg.does_item_exist("usb_note"):
+                    dpg.set_value("usb_note", msg)
+                    dpg.configure_item("btn_usb_fix", enabled=True)
+            self.post(done)
+        threading.Thread(target=body, name="fix-adb-usb", daemon=True).start()
+
+    def usb_ask_again(self):
+        dpg.set_value("usb_note", "正在請手機再問一次…")
+        self._watching = True           # 重開 adb 的這幾秒不要去問狀態
+
+        def body():
+            try:
+                DEV.ask_again()
+                msg = "好了，看一下手機螢幕。"
+            except Exception as e:
+                msg = "沒辦法重開 adb：%s" % e
+
+            def done():
+                self._watching = False
+                self._watch_t = 0.0
+                if dpg.does_item_exist("usb_note"):
+                    dpg.set_value("usb_note", msg)
+            self.post(done)
+        threading.Thread(target=body, name="adb-ask-again", daemon=True).start()
+
+    def _tick_watch(self):
+        """
+        還沒有手機的時候，每 2 秒問一次 adb（和 Windows）：
+        - 一插上、能用了 → 自己掃，不用找「重新掃描」
+        - 接著但 USB 偵錯沒開 → 跳出怎麼開
+        - 手機在問「允許 USB 偵錯嗎？」 → 跳出要按什麼，按了就自己繼續
+        只在看到的東西跟上次不一樣時才動作 —— 掃描失敗（例如手機裡沒有 B站）
+        不會每 2 秒再失敗一次。
+        """
+        if (self.device is not None or self.busy or self._watching
+                or not ENV.have("adb")):
+            return
+        now = time.time()
+        if now < self._watch_t:
+            return
+        self._watch_t = now + 2.0
+        self._watching = True
+
+        def body():
+            diag = (None, [])
+            try:
+                rows = DEV.device_states()
+                if not any(r[1] == "device" for r in rows):
+                    diag = DEV.usb_diagnosis(rows)
+            except Exception:
+                rows = None
+
+            def done():
+                self._watching = False
+                if rows is None or self.device is not None or self.busy:
+                    return
+                ready = frozenset(r[0] for r in rows if r[1] == "device")
+                first = self._watch_ready is None
+                new_ready = ready != self._watch_ready
+                self._watch_ready = ready
+                if ready:
+                    if self._usb_state is not None:
+                        self.set_usb_state(None)
+                    if new_ready and not first:
+                        self.log("看到手機了，開始掃描。")
+                        self.refresh_all()
+                    return
+                state, ids = diag
+                if state != self._usb_state:
+                    if state:
+                        self.log(self.USB_LOG[state])
+                    self.set_usb_state(state, ids)
+            self.post(done)
+        threading.Thread(target=body, name="adb-watch", daemon=True).start()
 
     def on_device_pick(self, sender, app_data, user_data):
         if not (0 <= user_data < len(self.devices)):
@@ -2153,6 +2347,18 @@ class App(object):
         if not self.filtered:
             if self.items:
                 msg = "沒有符合「%s」的影片。" % needle
+            elif self.device is None and self._usb_state == "waiting":
+                msg = ("手機接上了，正在問「允許 USB 偵錯嗎？」。在手機上按「允許」，"
+                       "這裡會自己繼續。")
+            elif self.device is None and self._usb_state == "driver":
+                msg = ("手機開了 USB 偵錯，但 Windows 還少一個設定。按視窗裡的「補上設定」"
+                       "（關掉了的話按「重新掃描手機」再叫出來）。")
+            elif self.device is None and self._usb_state == "nodriver":
+                msg = ("手機開了 USB 偵錯，但 Windows 沒有它的 adb 驅動程式。"
+                       "按「重新掃描手機」看怎麼裝。")
+            elif self.device is None and self._usb_state == "off":
+                msg = ("手機接上了，但還沒開「USB 偵錯」。設定 → 開發人員選項 → "
+                       "打開「USB 偵錯」，開好之後這裡會自己繼續。")
             elif self.device is None:
                 msg = ("還沒連上手機。接上 USB、開啟「USB 偵錯」，再按下面的「重新掃描手機」。"
                        "沒有線的話，頂端的裝置選單裡有「用 Wi-Fi 連線」。")
@@ -3469,6 +3675,7 @@ class App(object):
         self._tick_aligns()
         self.tick_drag()
         self._tick_hover()
+        self._tick_watch()
 
         frame = None
         if self.player is not None and self.player.playing:
@@ -3741,6 +3948,55 @@ class App(object):
     # 備份位置 / 還原
     # ======================================================================= #
 
+    def pick_path(self, on_done, fallback, **kw):
+        """
+        Windows 原生的開啟視窗（跟檔案總管同一個）；叫不出來就開 Dear PyGui 的
+        （fallback 是它的 tag）。視窗開著的時候會卡住，所以放背景執行緒，
+        介面照樣會畫；選好之後 on_done(路徑) 回到主執行緒跑。
+        """
+        if self._picking:
+            return
+        self._picking = True
+        owner = self._hwnd
+
+        def work():
+            err = None
+            try:
+                path = FD.pick(owner=owner, **kw)
+            except FD.Unavailable as e:
+                path, err = None, e
+            except Exception as e:
+                path, err = None, e
+
+            def done():
+                self._picking = False
+                if err is not None:
+                    dpg.show_item(fallback)
+                elif path:
+                    on_done(path)
+            self.post(done)
+        threading.Thread(target=work, name="file-dialog", daemon=True).start()
+
+    def pick_tool_zip(self):
+        self.pick_path(lambda p: self.install_tools([p]), "dlg_tool_zip",
+                       title="選擇下載好的 adb 或 ffmpeg 壓縮檔",
+                       filters=[("壓縮檔 (*.zip)", "*.zip"),
+                                ("所有檔案", "*.*")])
+
+    def pick_backup_file(self):
+        self.pick_path(
+            lambda p: self.on_pick_backup_file(None, {"file_path_name": p}),
+            "dlg_backup_file", title="選擇要還原的備份",
+            filters=[("bili-trim 備份 (*%s)" % BK.EXT, "*" + BK.EXT),
+                     ("所有檔案", "*.*")],
+            start_dir=self.cfg["backup_dir"])
+
+    def pick_backup_dir(self):
+        self.pick_path(
+            lambda p: self.on_pick_backup_dir(None, {"file_path_name": p}),
+            "dlg_backup_dir", folder=True, title="備份要放在哪個資料夾",
+            start_dir=self.cfg["backup_dir"])
+
     def on_pick_backup_dir(self, sender, app_data):
         path = app_data.get("file_path_name") or app_data.get("current_path")
         if not path:
@@ -4009,7 +4265,7 @@ class App(object):
 
         for tag in ("root", "dlg_backup_dir", "dlg_backup_file", "win_restore",
                     "win_confirm", "win_help", "win_env", "win_log", "win_wifi",
-                    "dlg_tool_zip",
+                    "dlg_tool_zip", "win_usb",
                     "pop_dev",
                     "pop_backup", "pop_settings", "pop_help", "preview_tex",
                     "tex_reg"):
@@ -4144,6 +4400,7 @@ class App(object):
         dpg.setup_dearpygui()
         dpg.show_viewport()
         # 檔案總管拖進來的壓縮檔（環境檢查的「拖曳到這個視窗」）
+        self._hwnd = DROP._find_window(title)
         if not DROP.install(title, lambda files: self.post(
                 lambda: self.on_files_dropped(files))):
             self.log("這台電腦上沒辦法把檔案拖進視窗；請用環境檢查裡的「選擇檔案」。")
