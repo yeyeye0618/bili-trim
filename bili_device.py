@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import threading
 import time
@@ -152,6 +153,249 @@ def list_devices():
 
 
 # --------------------------------------------------------------------------- #
+# 無線偵錯（Wi-Fi）
+# --------------------------------------------------------------------------- #
+#
+# Android 11 以上的「無線偵錯」讓 adb 改走 Wi-Fi，USB 能做的它都能做。
+# 流程有兩段，各用一組不同的埠號，這是使用者最容易填錯的地方：
+#
+#   配對（只有第一次）：手機上「使用配對碼配對裝置」的視窗給一組 IP:埠號
+#                       和 6 位數配對碼 -> adb pair
+#   連線（之後每次）：  「無線偵錯」主畫面上的「IP 位址和通訊埠」 -> adb connect
+#
+# 手機重開機或換 Wi-Fi 之後無線偵錯會關掉、埠號會變；配對不用重做。
+# 埠號可以不必手打：手機開著無線偵錯時會在區網廣播（mDNS），adb mdns services
+# 看得到 —— 配對視窗開著的時候連配對用的那組也看得到。
+#
+# 藍芽沒有這條路：adb 只能走 USB 或網路。
+
+_ADDR = re.compile(r"^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*:\s*([0-9]{1,5})\s*$")
+_ADDR_ANY = re.compile(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3}):([0-9]{1,5})")
+
+
+def parse_addr(text):
+    """「192.168.1.23:37165」-> 同一個字串（容許空白和全形冒號）；看不懂丟 ValueError。"""
+    t = (text or "").strip().replace("：", ":").replace(" ", "")
+    m = _ADDR.match(t)
+    if not m:
+        raise ValueError("要填「IP:埠號」，像 192.168.1.23:37165")
+    if any(int(p) > 255 for p in m.group(1).split(".")):
+        raise ValueError("IP 位址不對：%s" % m.group(1))
+    port = int(m.group(2))
+    if not 0 < port < 65536:
+        raise ValueError("埠號不對：%s" % port)
+    return "%s:%d" % (m.group(1), port)
+
+
+def host_of(addr):
+    return (addr or "").rsplit(":", 1)[0]
+
+
+def _run_any(args, timeout):
+    """跑 adb，不管結束碼，回傳 (結束碼, stdout+stderr)。"""
+    exe = adb_exe()
+    if exe is None:
+        raise AdbError(ENV.missing_hint("adb"))
+    try:
+        r = subprocess.run([exe] + list(args), capture_output=True,
+                           env=_adb_env(), timeout=timeout,
+                           creationflags=_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return -1, "timeout"
+    text = (r.stdout + b"\n" + r.stderr).decode("utf-8", "replace").strip()
+    return r.returncode, text
+
+
+def pair(addr, code, timeout=30):
+    """配對。成功就安靜回來，失敗丟 AdbError（訊息講下一步怎麼做）。"""
+    addr = parse_addr(addr)
+    code = re.sub(r"\D", "", code or "")
+    if len(code) != 6:
+        raise ValueError("配對碼是手機上顯示的 6 位數字")
+    rc, out = _run_any(["pair", addr, code], timeout)
+    if "successfully paired" in out.lower():
+        return
+    low = out.lower()
+    if "wrong password" in low or "connection was dropped" in low:
+        why = "配對碼不對，或手機上的配對視窗已經關了 —— 重新點一次「使用配對碼配對裝置」再試。"
+    elif (rc == -1 or "unable to start pairing" in low or "failed to connect" in low
+          or "protocol fault" in low or "cannot connect" in low):
+        why = ("連不到手機的配對埠。確認：IP:埠號是「使用配對碼配對裝置」那個視窗裡的"
+               "（不是無線偵錯主畫面那組）、視窗還開著、手機和電腦連同一個 Wi-Fi。")
+    else:
+        why = "adb 說：%s" % (out.splitlines()[-1] if out else "（沒有訊息）")
+    raise AdbError("配對失敗。" + why)
+
+
+def connect(addr, timeout=20):
+    """連線。成功（或本來就連著）安靜回來，失敗丟 AdbError。"""
+    addr = parse_addr(addr)
+    rc, out = _run_any(["connect", addr], timeout)
+    low = out.lower()
+    if ("connected to" in low and "failed" not in low and "cannot" not in low
+            and "unable" not in low):
+        return addr
+    if "authenticate" in low or "unauthorized" in low:
+        why = "這台電腦還沒跟手機配對 —— 先做上面的「配對」。"
+    # Windows 上 adb 直接轉述系統訊息（中文）加 socket 錯誤碼：10061 拒絕、10060 逾時
+    elif "refused" in low or "10061" in low:
+        why = ("手機拒絕連線。確認無線偵錯還開著，而且填的是「無線偵錯」主畫面上的"
+               "「IP 位址和通訊埠」（埠號跟配對用的不一樣，而且手機重開後會變）。")
+    elif (rc == -1 or "timed out" in low or "timeout" in low or "no route" in low
+          or "10060" in low or "10065" in low or "10051" in low):
+        why = "等不到手機回應。手機和電腦要連同一個 Wi-Fi，而且手機螢幕上無線偵錯要開著。"
+    else:
+        why = "adb 說：%s" % (out.splitlines()[-1] if out else "（沒有訊息）")
+    raise AdbError("連線失敗。" + why)
+
+
+def disconnect(serial):
+    _run_any(["disconnect", serial], 15)
+
+
+def parse_mdns(text):
+    """adb mdns services 的輸出 -> {"pair": [(名稱, 位址)], "connect": [...]}。"""
+    found = {"pair": [], "connect": []}
+    for line in (text or "").splitlines():
+        m = _ADDR_ANY.search(line)
+        if not m:
+            continue
+        addr = "%s:%s" % (m.group(1), m.group(2))
+        name = line.split()[0] if line.split() else ""
+        if "_adb-tls-pairing." in line:
+            found["pair"].append((name, addr))
+        elif "_adb-tls-connect." in line:
+            found["connect"].append((name, addr))
+    return found
+
+
+def discover(timeout=10):
+    """區網上開著無線偵錯的手機。adb 太舊或 mDNS 不能用就回空的，不丟例外。"""
+    try:
+        rc, out = _run_any(["mdns", "services"], timeout)
+    except AdbError:
+        return {"pair": [], "connect": []}
+    return parse_mdns(out)
+
+
+# ---- 自己找埠號 ----
+#
+# 有些手機（實測：vivo）不在區網廣播無線偵錯的服務，有些網路（學校、公司）
+# 也會擋廣播，上面的 discover() 就什麼都找不到。但手機的 IP 通常不變，只有
+# 埠號會變（手機重開、無線偵錯關掉再開、在手機上點「重新連線」都會變）。
+#
+# 所以直接試那支手機的高位埠號（Android 的臨時埠範圍 32768–60999）。開著的
+# 埠不一定是 adb，所以每個開著的埠都送一個 adb 的開頭封包（CNXN）：無線偵錯
+# 會回 STLS（要求改走 TLS），舊式的 adb tcpip 會回 AUTH 或 CNXN，別的程式不會。
+# 這個握手不會配對、不會授權任何東西，送完就斷。
+#
+# 速度（實測，一支 vivo 手機）：Windows 碰到「拒絕連線」會自己重試，一個關著的埠
+# 要將近 2 秒才回報失敗；但開著的埠在區網裡幾十毫秒就連上。所以每個埠最多
+# 等 0.3 秒、同時試 3000 個，整段 28k 個埠約 3 秒，找到 adb 就提早停（通常 2 秒）。
+# 一定要快：掃得比手機螢幕自動熄滅還久的話，下面這個問題會讓它白掃。
+#
+# 實測到的陷阱：手機螢幕鎖過之後，有些手機（vivo）會悄悄停掉無線偵錯，
+# 設定畫面卻還寫著開著、還顯示舊的埠號 —— 那個埠其實拒絕連線。這時候怎麼找
+# 都找不到，只能在手機上把無線偵錯關掉再打開（會換一個新的埠號）。
+
+A_CNXN, A_STLS, A_AUTH = 0x4E584E43, 0x534C5453, 0x48545541
+PORT_LO, PORT_HI = 32768, 60999
+
+
+def _cnxn_packet():
+    data = b"host::\0"
+    return struct.pack("<6I", A_CNXN, 0x01000001, 256 * 1024, len(data), 0,
+                       A_CNXN ^ 0xFFFFFFFF) + data
+
+
+def find_adb_ports(host, lo=PORT_LO, hi=PORT_HI, extra=(5555,), concurrency=3000,
+                   timeout=0.3, stop_at_first=True, progress=None):
+    """
+    回傳這台主機上有 adb 在聽的埠號 [(埠號, "STLS"/"AUTH"/"CNXN"), ...]。
+    progress(已試, 總數) 會被節流呼叫。在背景執行緒呼叫（會跑一陣子）。
+    """
+    import asyncio
+    ports = list(extra) + [p for p in range(lo, hi + 1) if p not in extra]
+    total = len(ports)
+    found, state = [], {"next": 0, "done": 0, "stop": False, "t": 0.0}
+    names = {A_STLS: "STLS", A_AUTH: "AUTH", A_CNXN: "CNXN"}
+    packet = _cnxn_packet()
+
+    async def probe(port):
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        except Exception:
+            return
+        try:
+            w.write(packet)
+            await w.drain()
+            hdr = await asyncio.wait_for(r.readexactly(24), 2.0)
+            cmd = struct.unpack("<I", hdr[:4])[0]
+            if cmd in names:
+                found.append((port, names[cmd]))
+                if stop_at_first:
+                    state["stop"] = True
+        except Exception:
+            pass
+        finally:
+            try:
+                w.close()
+            except Exception:
+                pass
+
+    async def worker():
+        while not state["stop"] and state["next"] < total:
+            port = ports[state["next"]]
+            state["next"] += 1
+            await probe(port)
+            state["done"] += 1
+            now = time.time()
+            if progress and now - state["t"] > 0.25:
+                state["t"] = now
+                progress(state["done"], total)
+
+    async def main():
+        await asyncio.gather(*(worker() for _ in range(min(concurrency, total))))
+
+    asyncio.run(main())
+    if progress:
+        progress(total, total)
+    return sorted(found)
+
+
+def drop_stale(host=None):
+    """
+    adb 還掛著、但已經連不到的 Wi-Fi 連線（狀態 offline）先拿掉。不清的話，
+    手機換了埠號之後 adb devices 會一直列著那條死掉的，看起來像連著。
+    """
+    try:
+        out = _run(["devices"], timeout=15)
+    except AdbError:
+        return
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] == "device":
+            continue
+        serial = parts[0]
+        if not (_ADDR.match(serial) or "._adb-tls-connect." in serial):
+            continue
+        if host is None or host_of(serial) == host:
+            disconnect(serial)
+
+
+def host_reachable(host, timeout_ms=800):
+    """ping 一下。手機不在網路上就別花十幾秒掃它的埠。"""
+    flag = ["-n", "1", "-w", str(timeout_ms)] if os.name == "nt" \
+        else ["-c", "1", "-W", str(max(timeout_ms // 1000, 1))]
+    try:
+        r = subprocess.run(["ping"] + flag + [host], capture_output=True,
+                           timeout=timeout_ms / 1000.0 + 3, creationflags=_NO_WINDOW)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
 # 緩存項目
 # --------------------------------------------------------------------------- #
 
@@ -256,7 +500,16 @@ class Device(object):
         return "<Device %s %s>" % (self.serial, self.model)
 
     @property
+    def wireless(self):
+        """用 Wi-Fi 連著的：序號是 IP:埠號，或 adb 自動連上時用的 mDNS 服務名稱。"""
+        return bool(_ADDR.match(self.serial)) or "._adb-tls-connect." in self.serial
+
+    @property
     def label(self):
+        if self.wireless:
+            where = "Wi-Fi %s" % host_of(self.serial) if _ADDR.match(self.serial) \
+                else "Wi-Fi"
+            return "%s（%s）" % (self.model, where) if self.model else where
         return "%s（%s）" % (self.serial, self.model) if self.model else self.serial
 
     # ---- 低階 ----

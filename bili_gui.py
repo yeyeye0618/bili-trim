@@ -266,6 +266,8 @@ def crisp(v):
     return int(v) + 0.5
 
 
+# 不能出現在行首的標點（中文排版的避頭規則）
+_NO_LINE_START = set("，。、；：？！」』）】〉》…—,.;:?!)]}")
 _ASCII_RUN = re.compile(r"[\x00-\x7f]+|[^\x00-\x7f]+")
 _WRAP_TOKEN = re.compile(r"[A-Za-z0-9_.,:;!?'\"()\[\]/%+\-@#&*=~]+|\s|.")
 
@@ -323,6 +325,8 @@ class App(object):
         self._later = []
         self._hover = None
         self._foot_text = ""
+        self._prefer_serial = None
+        self._wifi_busy = False
         self._grid_k = 1
         self._native = (0, 0)
         self._adb_label = "adb 檢查中…"
@@ -466,6 +470,11 @@ class App(object):
             except Exception as e:
                 tb = traceback.format_exc()
                 self.log("【%s】失敗：%s" % (name, e))
+                if isinstance(e, DEV.AdbError) and self.device is not None \
+                        and self.device.wireless:
+                    self.log("    用 Wi-Fi 連著：手機螢幕鎖住之後，有些手機（例如 vivo）會停掉"
+                             "無線偵錯。把螢幕打開，按「重新掃描手機」讓程式重新找到它；"
+                             "還是不行就在手機上把無線偵錯關掉再打開。")
                 self.post(self.show_log)      # 失敗一定要讓人看到整段說明
                 if not isinstance(e, (DEV.AdbError, BK.BackupError,
                                       MED.MediaError, ValueError)):
@@ -558,7 +567,8 @@ class App(object):
         while i < n:
             tok = tokens[i]
             w = sum(cw(c) for c in tok)
-            if cur and cur_w + w > width:
+            # 句讀不放行首：逗號、句號、右括號這些超出一點也掛在上一行行尾
+            if cur and cur_w + w > width and not (len(tok) == 1 and tok in _NO_LINE_START):
                 lines.append(cur.rstrip())
                 cur, cur_w = "", 0.0
                 if len(lines) == max_lines:
@@ -757,6 +767,8 @@ class App(object):
         if dpg.does_item_exist("chip_dev"):
             if dev is None:
                 label = "沒有連線的手機"
+            elif dev.wireless:
+                label = dev.label.replace("（", " · ").rstrip("）")
             else:
                 label = ("%s · %s" % (dev.model, dev.serial) if dev.model
                          else dev.serial)
@@ -776,9 +788,14 @@ class App(object):
                                   user_data=n, callback=self.on_device_pick)
             if not self.devices:
                 self.font(dpg.add_text("adb 看不到裝置。接上 USB、開啟「USB 偵錯」，"
-                                       "並在手機上允許這台電腦。",
+                                       "並在手機上允許這台電腦；沒有線的話用下面的"
+                                       "「用 Wi-Fi 連線」。",
                                        parent="pop_dev_list", wrap=px(300),
                                        color=LOOK.INK_2), "small")
+            if dev is not None and dev.wireless:
+                dpg.add_menu_item(label="中斷這支的 Wi-Fi 連線",
+                                  parent="pop_dev_list",
+                                  callback=self.disconnect_wifi)
 
     def _build_popups(self):
         """頂列的四個選單。點一下就開，不是右鍵。"""
@@ -789,6 +806,8 @@ class App(object):
             dpg.add_separator()
             dpg.add_menu_item(label="重新掃描裝置與快取",
                               callback=lambda: self.refresh_all())
+            dpg.add_menu_item(label="用 Wi-Fi 連線…",
+                              callback=self.show_wifi_window)
         with dpg.popup("bar_backup", mousebutton=left, tag="pop_backup",
                        min_size=(px(280), px(20))):
             self.font(dpg.add_text("", tag="backup_dir_label", wrap=px(320),
@@ -1100,6 +1119,373 @@ class App(object):
     def copy_log(self):
         self.copy_text("\n".join(self.log_lines))
 
+    # ======================================================================= #
+    # 用 Wi-Fi 連線（Android 11 以上的「無線偵錯」）
+    # ======================================================================= #
+
+    def _build_wifi_window(self):
+        W = px(780)
+
+        def section(title, note):
+            dpg.add_spacer(height=px(4))
+            self.font(dpg.add_text(title), "strong")
+            self.font(dpg.add_text(note, wrap=W, color=LOOK.INK_2), "small")
+
+        self.font(dpg.add_text(
+            "不用接線，改走 Wi-Fi：手機要 Android 11 以上，跟電腦在同一個區網（電腦用"
+            "網路線也行）。手機上：開發人員選項 →「無線偵錯」打開。找手機和傳檔的時候，"
+            "手機螢幕要亮著。", wrap=W), "body")
+
+        section("找手機",
+                "程式會找用 Wi-Fi 連過的手機，和在網路上廣播的手機，並自己試出它現在的"
+                "埠號（約 3 秒）。找到的列在下面，選一支按「連線」。")
+        with dpg.group(horizontal=True):
+            b = dpg.add_button(label="找手機", tag="btn_wifi_scan", width=px(110),
+                               callback=self.wifi_search)
+            self.theme(b, "ink")
+            self.font(b, "strong")
+            with dpg.group() as g:
+                self.theme(g, "tight")
+                dpg.add_spacer(height=px(11))
+                p_ = dpg.add_progress_bar(tag="wifi_prog", width=px(240),
+                                          height=px(10), show=False)
+                self.theme(p_, "progress")
+        dpg.add_group(tag="wifi_results")
+        self.font(dpg.add_text("", tag="wifi_status", wrap=W,
+                               color=LOOK.INK_2), "small")
+
+        section("只知道手機的 IP",
+                "填「無線偵錯」畫面上的 IP（冒號前面那段），程式會幫你試出埠號。")
+        with dpg.group(horizontal=True):
+            t = dpg.add_input_text(tag="wifi_ip", width=px(270), hint="192.168.1.23",
+                                   on_enter=True, callback=self.wifi_find_ip)
+            self.font(t, "num")
+            dpg.add_button(label="找埠號", tag="btn_wifi_ip", width=px(110),
+                           callback=self.wifi_find_ip)
+
+        section("第一次：配對",
+                "在手機上點「使用配對碼配對裝置」，把跳出來的視窗裡的「IP 位址和通訊埠」"
+                "和 6 位數配對碼填在這裡。配對只要做一次。")
+        with dpg.group(horizontal=True):
+            t = dpg.add_input_text(tag="wifi_pair_addr", width=px(270),
+                                   hint="192.168.1.23:37165")
+            self.font(t, "num")
+            t = dpg.add_input_text(tag="wifi_code", width=px(150),
+                                   hint="6 位數配對碼", decimal=True,
+                                   on_enter=True, callback=self.wifi_pair)
+            self.font(t, "body")          # 提示字是中文，數字字型畫不出來
+            dpg.add_button(label="配對", tag="btn_wifi_pair", width=px(110),
+                           callback=self.wifi_pair)
+
+        section("手動連線",
+                "直接填「無線偵錯」畫面上的「IP 位址和通訊埠」（跟配對用的埠號不一樣）。")
+        with dpg.group(horizontal=True):
+            t = dpg.add_input_text(tag="wifi_conn_addr", width=px(270),
+                                   hint="192.168.1.23:41235", on_enter=True,
+                                   callback=self.wifi_connect)
+            self.font(t, "num")
+            dpg.add_button(label="連線", tag="btn_wifi_conn", width=px(110),
+                           callback=self.wifi_connect)
+
+        dpg.add_spacer(height=px(4))
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="關閉", width=px(96),
+                           callback=lambda: dpg.hide_item("win_wifi"))
+            with dpg.group() as g:
+                self.theme(g, "tight")
+                dpg.add_spacer(height=px(7))
+                self.font(dpg.add_text(
+                    "藍芽沒辦法：adb 只能走 USB 或網路，藍芽傳檔也進不去 B站 的快取資料夾。",
+                    color=LOOK.INK_2), "small")
+
+    def show_wifi_window(self):
+        self.center_window("win_wifi")
+        dpg.show_item("win_wifi")
+        self.wifi_search()
+
+    def _wifi_status(self, text, kind="info"):
+        if not dpg.does_item_exist("wifi_status"):
+            return
+        color = {"ok": LOOK.OK, "bad": LOOK.INK}.get(kind, LOOK.INK_2)
+        dpg.set_value("wifi_status", text)
+        dpg.configure_item("wifi_status", color=color)
+        self.font("wifi_status", "strong_s" if kind == "bad" else "small")
+
+    def _wifi_job(self, busy_text, fn):
+        """在背景跑一個 adb 動作，按鈕先停用，結果寫回視窗裡那一行。"""
+        if getattr(self, "_wifi_busy", False):
+            return
+        self._wifi_busy = True
+        tags = ("btn_wifi_pair", "btn_wifi_conn", "btn_wifi_scan",
+                "btn_wifi_ip")
+        for t in tags:
+            if dpg.does_item_exist(t):
+                dpg.configure_item(t, enabled=False)
+        self._wifi_status(busy_text)
+
+        def body():
+            try:
+                result = fn()
+            except (DEV.AdbError, ValueError) as e:
+                result = (str(e), "bad", None)
+            except Exception as e:
+                result = ("出錯了：%s" % e, "bad", None)
+
+            def done():
+                self._wifi_busy = False
+                if dpg.does_item_exist("wifi_prog"):
+                    dpg.configure_item("wifi_prog", show=False)
+                for t in tags:
+                    if dpg.does_item_exist(t):
+                        dpg.configure_item(t, enabled=True)
+                text, kind, after = result
+                self._wifi_status(text, kind)
+                if kind == "bad":
+                    self.log("Wi-Fi：%s" % text)
+                if after:
+                    after()
+            self.post(done)
+        threading.Thread(target=body, name="wifi", daemon=True).start()
+
+    def _fill(self, tag, value):
+        if value and dpg.does_item_exist(tag) and not (dpg.get_value(tag) or "").strip():
+            dpg.set_value(tag, value)
+
+    # ---- 找手機 ----
+
+    NOT_LISTENING = ("手機在網路上，但無線偵錯沒有在聽。螢幕鎖過的話，有些手機（例如 vivo）"
+                     "會悄悄停掉無線偵錯，畫面上卻還寫著開著、還顯示舊的埠號 —— "
+                     "在手機上把無線偵錯關掉再打開，再按一次「找手機」。")
+
+    def _wifi_prog(self, done, total, host):
+        if dpg.does_item_exist("wifi_prog"):
+            dpg.configure_item("wifi_prog", show=True)
+            dpg.set_value("wifi_prog", done / float(max(total, 1)))
+        self._wifi_status("正在試 %s 的埠號…" % host)
+
+    def _probe_host(self, host, source):
+        """（背景執行緒）一台主機：在不在網路上、無線偵錯在哪個埠。回傳一列結果。"""
+        row = {"host": host, "source": source, "addrs": [], "note": ""}
+        if not DEV.host_reachable(host):
+            row["note"] = "不在網路上（手機沒連這個網路，或 IP 換了）"
+            return row
+        ports = DEV.find_adb_ports(
+            host, progress=lambda d, n: self.post(
+                lambda d=d, n=n: self._wifi_prog(d, n, host)))
+        row["addrs"] = ["%s:%d" % (host, p) for p, _ in ports]
+        if not row["addrs"]:
+            row["note"] = self.NOT_LISTENING
+        return row
+
+    def _show_wifi_results(self, rows):
+        if not dpg.does_item_exist("wifi_results"):
+            return
+        dpg.delete_item("wifi_results", children_only=True)
+        names = self.cfg.get("wifi_names") or {}
+        W = px(780)
+        for row in rows:
+            model = names.get(row["host"], "")
+            title = "%s（%s）" % (model, row["host"]) if model else row["host"]
+            for addr in row["addrs"] or [None]:
+                with dpg.group(horizontal=True, parent="wifi_results"):
+                    if addr:
+                        b = dpg.add_button(label="連線", width=px(90), user_data=addr,
+                                           callback=self._wifi_connect_to)
+                        self.theme(b, "ink")
+                    with dpg.group() as g:
+                        self.theme(g, "tight")
+                        dpg.add_spacer(height=px(6))
+                        self.font(dpg.add_text(
+                            "%s　埠號 %s　· %s" % (title, addr.rsplit(":", 1)[1], row["source"])
+                            if addr else "%s　· %s" % (title, row["source"])), "body")
+                if not addr and row["note"]:
+                    self.font(dpg.add_text(row["note"], wrap=W, color=LOOK.INK_2,
+                                           parent="wifi_results"), "small")
+
+    def wifi_search(self, *_):
+        hosts = list(self.cfg.get("wifi_hosts") or [])
+
+        def work():
+            rows, seen = [], set()
+            found = DEV.discover(timeout=5)
+            pair = found["pair"][0][1] if found["pair"] else ""
+            for _, addr in found["connect"]:
+                h = DEV.host_of(addr)
+                if h not in seen:
+                    seen.add(h)
+                    rows.append({"host": h, "source": "網路上廣播的", "addrs": [addr],
+                                 "note": ""})
+            for h in hosts:
+                if h not in seen:
+                    seen.add(h)
+                    rows.append(self._probe_host(h, "用 Wi-Fi 連過"))
+
+            def show():
+                self._fill("wifi_pair_addr", pair)
+                self._show_wifi_results(rows)
+            if any(r["addrs"] for r in rows):
+                text, kind = "找到了，選一支按「連線」。", "ok"
+            elif rows:
+                text, kind = "沒找到開著無線偵錯的手機，看上面每一支的說明。", "info"
+            else:
+                text, kind = ("還沒用 Wi-Fi 連過手機，網路上也沒有手機在廣播。"
+                              "在下面填手機的 IP，程式會幫你試出埠號；第一次還要先配對。"), "info"
+            if pair:
+                text += "另外找到手機的配對視窗，配對位址已經填好。"
+            return text, kind, show
+        self._wifi_job("找手機…", work)
+
+    def wifi_find_ip(self, *_):
+        text = (dpg.get_value("wifi_ip") or "").strip().replace("：", ":")
+
+        def work():
+            host = text.rsplit(":", 1)[0] if ":" in text else text
+            DEV.parse_addr(host + ":1")              # 只是借來檢查 IP 的格式
+            row = self._probe_host(host, "剛剛填的 IP")
+
+            def show():
+                self._show_wifi_results([row])
+            if row["addrs"]:
+                return "找到了，按「連線」。沒配對過的話，連線會告訴你要先配對。", "ok", show
+            return "這個 IP 沒找到無線偵錯，看上面的說明。", "info", show
+        self._wifi_job("找埠號…", work)
+
+    def _wifi_connect_to(self, sender, app_data, addr):
+        def work():
+            DEV.drop_stale(DEV.host_of(addr))
+            serial = DEV.connect(addr)
+            return self._wifi_connected(serial, DEV.host_of(serial))
+        self._wifi_job("連線中…", work)
+
+    def wifi_pair(self, *_):
+        addr = dpg.get_value("wifi_pair_addr")
+        code = dpg.get_value("wifi_code")
+
+        def work():
+            DEV.pair(addr, code)
+            host = DEV.host_of(DEV.parse_addr(addr))
+            # 配對完手機會改廣播「連線」那一組；adb 有時也會自己連上
+            for _ in range(8):
+                for d in DEV.list_devices():
+                    if d.wireless and (DEV.host_of(d.serial) == host
+                                       or not DEV._ADDR.match(d.serial)):
+                        return self._wifi_connected(d.serial, host)
+                conns = [a for _, a in DEV.discover(timeout=5)["connect"]
+                         if DEV.host_of(a) == host]
+                if conns:
+                    return self._wifi_connected(DEV.connect(conns[0]), host)
+                time.sleep(1.0)
+
+            def ask():
+                if dpg.does_item_exist("wifi_conn_addr") and \
+                        not (dpg.get_value("wifi_conn_addr") or "").strip():
+                    dpg.set_value("wifi_conn_addr", host + ":")
+            return ("配對好了。現在填「連線」那一格（無線偵錯主畫面上的 IP 位址和通訊埠），"
+                    "按「連線」。", "ok", ask)
+        self._wifi_job("配對中…", work)
+
+    def wifi_connect(self, *_):
+        addr = dpg.get_value("wifi_conn_addr")
+
+        def work():
+            DEV.drop_stale(DEV.host_of(DEV.parse_addr(addr)))
+            serial = DEV.connect(addr)
+            return self._wifi_connected(serial, DEV.host_of(serial))
+        self._wifi_job("連線中…", work)
+
+    def _wifi_connected(self, serial, host):
+        """（背景執行緒）記住這支手機，回傳讓視窗關掉並重新掃描的結果。"""
+        hosts = [h for h in (self.cfg.get("wifi_hosts") or []) if h != host]
+        self.cfg["wifi_hosts"] = ([host] + hosts)[:5]
+        if DEV._ADDR.match(serial):
+            self.cfg["wifi_last"] = serial
+        save_config(self.cfg)
+        self.log("Wi-Fi：連上 %s" % serial)
+
+        def after():
+            dpg.hide_item("win_wifi")
+            self._prefer_serial = serial
+            self.refresh_all()
+        return "連上了。", "ok", after
+
+    def _reconnect_wifi(self, hosts):
+        """
+        （背景執行緒）幫用 Wi-Fi 連過的手機重新連線。依序：區網廣播 -> 上次那組
+        IP:埠號 -> 自己試出埠號（手機重開、無線偵錯關掉再開之後埠號會變）。
+        已經有手機連著（USB 或 Wi-Fi）就不花這個時間。
+        """
+        DEV.drop_stale()
+        try:
+            if DEV.list_devices():
+                return
+        except DEV.AdbError:
+            return
+
+        def done(addr, how):
+            self.cfg["wifi_last"] = addr
+            save_config(self.cfg)
+            self.log("Wi-Fi：重新連上 %s（%s）" % (addr, how))
+            return True
+
+        for _, addr in DEV.discover(timeout=5)["connect"]:
+            if DEV.host_of(addr) in hosts:
+                try:
+                    DEV.connect(addr, timeout=10)
+                    return done(addr, "網路廣播")
+                except (DEV.AdbError, ValueError):
+                    pass
+        last = self.cfg.get("wifi_last") or ""
+        if last and DEV.host_of(last) in hosts:
+            try:
+                DEV.connect(last, timeout=6)
+                return done(last, "上次的埠號")
+            except (DEV.AdbError, ValueError):
+                pass
+        for host in hosts:
+            if not DEV.host_reachable(host):
+                continue
+            label = "找 %s 的無線偵錯埠號" % host
+            self.progress(0.02, label)
+            ports = DEV.find_adb_ports(
+                host, progress=lambda d, n: self.progress(0.02 + 0.06 * d / n, label))
+            for port, _ in ports:
+                addr = "%s:%d" % (host, port)
+                try:
+                    DEV.connect(addr, timeout=10)
+                    return done(addr, "試出新的埠號")
+                except (DEV.AdbError, ValueError):
+                    pass
+            if not ports:
+                self.log("Wi-Fi：" + self.NOT_LISTENING)
+
+    def disconnect_wifi(self, *_):
+        dev = self.device
+        if dev is None or not dev.wireless:
+            return
+        host = DEV.host_of(dev.serial)
+        self.cfg["wifi_hosts"] = [h for h in (self.cfg.get("wifi_hosts") or [])
+                                  if h != host]
+        if DEV.host_of(self.cfg.get("wifi_last") or "") == host:
+            self.cfg["wifi_last"] = ""
+        save_config(self.cfg)
+
+        def work():
+            DEV.disconnect(dev.serial)
+            self.log("Wi-Fi：中斷 %s（之後重新掃描不會再自動連它）" % dev.label)
+            return DEV.list_devices()
+
+        def done(devs):
+            if self.item is not None:
+                self.select_item(None)
+            self.devices, self.device = devs, None
+            self.items, self.roots = [], []
+            self._sync_device_ui()
+            self.rebuild_library()
+            if devs:                      # 還有別支（例如 USB 接著的）就換過去
+                self.refresh_all()
+        self.run_worker("中斷 Wi-Fi", work, done)
+
     def _sync_footer(self):
         for tag, text in (("adb_state", self._adb_label),
                           ("ff_state", self._ff_label),
@@ -1324,6 +1710,10 @@ class App(object):
                                callback=self.log_env_check)
                 dpg.add_button(label="關閉", width=px(96),
                                callback=lambda: dpg.hide_item("win_env"))
+
+        with dpg.window(label="用 Wi-Fi 連線", tag="win_wifi", show=False,
+                        modal=True, width=px(820), height=px(720)):
+            self._build_wifi_window()
 
         with dpg.window(label="訊息", tag="win_log", show=False,
                         width=px(860), height=px(520), no_collapse=True):
@@ -1551,15 +1941,28 @@ class App(object):
 
     def refresh_all(self):
         def work():
+            hosts = list(self.cfg.get("wifi_hosts") or [])
+            if hosts:
+                self._reconnect_wifi(hosts)
             devs = DEV.list_devices()
             if not devs:
-                raise DEV.AdbError(
-                    "adb 看不到裝置。確認手機已用 USB 連接、開啟「USB 偵錯」，"
-                    "並在手機上允許這台電腦。")
+                # 還沒接手機是正常狀態，不是錯誤：不要因此跳出訊息視窗，
+                # 左邊清單會寫下一步怎麼做
+                self.log("還沒看到手機：接上 USB 並開啟「USB 偵錯」，或用頂端裝置"
+                         "選單的「用 Wi-Fi 連線」。")
+                return None
             dev = self.device if self.device in devs else devs[0]
             for d in devs:
                 if self.device is not None and d.serial == self.device.serial:
                     dev = d
+            prefer, self._prefer_serial = self._prefer_serial, None
+            if prefer:
+                # 剛用 Wi-Fi 連上的那支優先；adb 自己用 mDNS 連上時序號不是
+                # IP:埠號，找不到就退而選第一支用 Wi-Fi 連著的
+                match = [d for d in devs if d.serial == prefer] or \
+                    [d for d in devs if d.wireless]
+                if match:
+                    dev = match[0]
             self.log("裝置：%s" % dev.label)
             self.progress(0.1, "找 B站 的快取目錄")
             roots = dev.find_roots()
@@ -1578,9 +1981,21 @@ class App(object):
             return devs, dev, roots, items
 
         def done(res):
+            if res is None:
+                self.devices, self.device, self.roots, self.items = [], None, [], []
+                self._sync_device_ui()
+                self.rebuild_library()
+                self.progress(0.0, "")
+                return
             devs, dev, roots, items = res
             self.devices, self.device, self.roots, self.items = \
                 devs, dev, roots, items
+            if dev.wireless and DEV._ADDR.match(dev.serial) and dev.model:
+                names = dict(self.cfg.get("wifi_names") or {})
+                if names.get(DEV.host_of(dev.serial)) != dev.model:
+                    names[DEV.host_of(dev.serial)] = dev.model
+                    self.cfg["wifi_names"] = names
+                    save_config(self.cfg)
             self.log("共 %d 支緩存影片，其中 %d 支可以處理。"
                      % (len(items),
                         sum(1 for i in items if i.unsupported_reason() is None)))
@@ -1625,7 +2040,8 @@ class App(object):
             if self.items:
                 msg = "沒有符合「%s」的影片。" % needle
             elif self.device is None:
-                msg = "還沒連上手機。接上 USB、開啟「USB 偵錯」，再按下面的「重新掃描手機」。"
+                msg = ("還沒連上手機。接上 USB、開啟「USB 偵錯」，再按下面的「重新掃描手機」。"
+                       "沒有線的話，頂端的裝置選單裡有「用 Wi-Fi 連線」。")
             else:
                 msg = "這台手機上沒有找到快取影片。先在 B站 App 裡下載幾支。"
             for i, line in enumerate(self.wrap(msg, "small", text_w, 4)):
@@ -3474,7 +3890,8 @@ class App(object):
             if dpg.does_item_exist("lib_filter") else ""
 
         for tag in ("root", "dlg_backup_dir", "dlg_backup_file", "win_restore",
-                    "win_confirm", "win_help", "win_env", "win_log", "pop_dev",
+                    "win_confirm", "win_help", "win_env", "win_log", "win_wifi",
+                    "pop_dev",
                     "pop_backup", "pop_settings", "pop_help", "preview_tex",
                     "tex_reg"):
             if dpg.does_item_exist(tag):
