@@ -15,7 +15,7 @@ videos still play inside the Bilibili app — same player, same danmaku, same
 resume position. Chinese-only UI and docs.*
 
 ```
-bili-trim.bat   點兩下就開始（找 Python → run.py）
+bili-trim.bat   原始碼版的入口：點兩下就開始（找 Python → run.py）；一般使用者用 Releases 的 exe
 run.py          入口：驗 Python 版本、補缺的套件，然後開視窗
 setup.py        命令列版的安裝，另外負責打包帶去別台電腦
 bili_gui.py     圖形介面（挑廣告、即時預覽、一鍵寫回手機）
@@ -97,13 +97,21 @@ bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 
 ## 開始用
 
-1. 下載這個專案：**Code → Download ZIP**，解壓到你自己的資料夾
-   （桌面、文件都可以，不要放 `Program Files`，那裡寫不進去）
+1. 到 [**Releases**](https://github.com/yeyeye0618/bili-trim/releases/latest)
+   下載 **`bili-trim.exe`**，放到你自己的資料夾
+   （桌面、文件都可以，不要放 `Program Files`，那裡寫不進去）。不用裝 Python
+2. **點兩下 `bili-trim.exe`**（圖示是一顆紅色的「b」印章）。
+   第一次 Windows 可能跳「Windows 已保護您的電腦」：按**其他資訊 → 仍要執行**
+   （exe 沒有數位簽章，不是中毒）
+3. 少了 `adb` 或 `ffmpeg` 的話，程式會自己跳出**環境檢查**視窗，
+   列出缺什麼、去哪裡下載、放到哪個資料夾，旁邊就是按鈕
+4. 手機接上電腦、開「USB 偵錯」，按左下角的**重新掃描手機**
+
+### 從原始碼跑（有 Python、想改程式的人）
+
+1. **Code → Download ZIP**，解壓到你自己的資料夾
 2. **點兩下 `bili-trim.bat`**
 3. 第一次會問要不要裝三個 Python 套件，按 Enter 就好
-4. 程式開起來。少了 `adb` 或 `ffmpeg` 的話，它會自己跳出**環境檢查**視窗，
-   列出缺什麼、去哪裡下載、放到哪個資料夾，旁邊就是按鈕
-5. 手機接上電腦、開「USB 偵錯」，按左下角的**重新掃描手機**
 
 沒有 Python 的話，第 2 步會告訴你去裝；裝完再點一次同一個檔案。
 （`winget install -e --id Python.Python.3.12`，或到
@@ -195,8 +203,14 @@ python.org 版、conda…）。套件裝在哪一個就要用哪一個開，不�
 python setup.py --exe
 ```
 
-用 PyInstaller 把 Python、介面套件、字型整個封成 `dist\bili-trim.exe`（約 50 MB），
-第一次會問要不要裝 PyInstaller。拿到 exe 的人：
+用 PyInstaller 把 Python、介面套件、字型整個封成 `dist\bili-trim.exe`（約 40 MB），
+第一次會問要不要裝 PyInstaller。
+
+發版不用自己做：推一個 `v` 開頭的 tag（`git tag v0.2.0`、`git push origin v0.2.0`），
+GitHub Actions（`.github/workflows/release-exe.yml`）會在 Windows 上做好 exe、
+掛到同名的 Release；Release 還沒有的話會先建一個草稿。
+
+拿到 exe 的人：
 
 1. 把 `bili-trim.exe` 放到任何自己的資料夾（不要放 `Program Files`）
 2. adb 和 ffmpeg 一樣要自己準備：已經在 PATH 裡就不用管；沒有的話在 exe 旁邊
