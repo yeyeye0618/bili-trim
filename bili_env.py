@@ -159,10 +159,12 @@ def reset():
 def missing_hint(name):
     _, need, why = TOOLS.get(name, (None, False, ""))
     label, url, howto = DOWNLOADS.get(name, (name, "", ""))
-    return ("找不到 %s（%s 這一包）—— %s。\n"
-            "到 %s 下載，%s —— PATH 不用改。\n"
-            "（也可以跑 python setup.py，它會問要不要幫你下載。）"
+    text = ("找不到 %s（%s 這一包）—— %s。\n"
+            "到 %s 下載，%s —— PATH 不用改。"
             % (name, label, why, url, howto))
+    if not FROZEN:      # exe 版旁邊沒有 setup.py，也不一定有 Python
+        text += "\n（也可以跑 python setup.py，它會問要不要幫你下載。）"
+    return text
 
 
 # --------------------------------------------------------------------------- #

@@ -97,6 +97,24 @@ def font_label_of(pt):
     return "標準"
 
 
+def set_taskbar_identity():
+    """
+    讓工作列顯示 bili-trim 的印章，而不是 Python 的圖示。
+
+    用 python run.py 開的時候，Windows 會把這個視窗算成 python.exe 的一份，
+    工作列就拿 python.exe 的圖示、跟其他 Python 視窗擠在同一格。給行程一個
+    自己的 AppUserModelID，工作列才會改用視窗本身的圖示（create_viewport 的
+    large_icon）。exe 版不需要，但設了也無害。必須在建立任何視窗之前呼叫。
+    """
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            ctypes.c_wchar_p("yeyeye0618.bili-trim"))
+    except (AttributeError, OSError):
+        pass
+
+
 def enable_dpi_awareness():
     """
     回傳螢幕的縮放倍率（125% -> 1.25）。必須在建立任何視窗之前呼叫。
@@ -1856,22 +1874,13 @@ class App(object):
         連結、資料夾、重新檢查都做成按鈕。
         """
         dpg.delete_item("env_list", children_only=True)
-        rows = self.env_rows()
-        for item, state, note in rows:
-            with dpg.group(horizontal=True, parent="env_list"):
-                dpg.add_text(ENV.MARK.get(state, "     ").strip(),
-                             color=self.STATE_COLOR.get(state))
-                dpg.add_text("%-10s" % item)
-                dpg.add_text(note, wrap=px(620))
 
         missing = [n for n in ("adb", "ffmpeg", "ffplay", "ffprobe")
                    if not ENV.have(n)]
         if not missing:
-            dpg.add_separator(parent="env_list")
             dpg.add_text("兩個外部程式都在，接上手機按「重新掃描」就可以開始。",
                          parent="env_list", color=self.STATE_COLOR["ok"],
                          wrap=px(860))
-            return
 
         # 同一包的只講一次（ffmpeg / ffplay / ffprobe 是一起下載的）
         shown = set()
@@ -1879,8 +1888,9 @@ class App(object):
             label, url, howto = ENV.DOWNLOADS[name]
             if label in shown:
                 continue
+            if shown:
+                dpg.add_separator(parent="env_list")
             shown.add(label)
-            dpg.add_separator(parent="env_list")
             with dpg.group(parent="env_list"):
                 dpg.add_text("缺 %s" % label, color=self.STATE_COLOR["bad"])
                 same = [n for n in missing if ENV.DOWNLOADS[n][0] == label]
@@ -1888,15 +1898,40 @@ class App(object):
                 for n in same:
                     dpg.add_text("    %s —— %s" % (n, ENV.TOOLS[n][2]),
                                  wrap=px(840))
-                dpg.add_text("下載：%s" % url, wrap=px(860))
+                # 網址放在唯讀輸入框裡：按鈕都失靈的時候，還能自己框選、Ctrl+C
+                with dpg.group(horizontal=True):
+                    dpg.add_text("下載：")
+                    t = dpg.add_input_text(default_value=url, readonly=True,
+                                           width=px(780))
+                    self.font(t, "small")
                 dpg.add_text("放法：%s" % howto, wrap=px(860))
+                dpg.add_text("tools 資料夾在：%s（按下面的「開啟 tools 資料夾」，"
+                             "沒有的話會幫你建）" % ENV.TOOLS_DIR, wrap=px(860))
+                status = dpg.generate_uuid()
+                # Dear PyGui 呼叫按鈕回呼時固定傳 (sender, app_data, user_data)，
+                # 網址要放 user_data —— 寫成 lambda 的預設參數會被第三個引數蓋成 None
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="開啟下載頁", width=px(140),
-                                   callback=lambda s_=None, a_=None, u=url:
-                                   self.open_url(u))
+                                   user_data=(url, status),
+                                   callback=lambda s_, a_, u:
+                                   self.open_url(*u))
                     dpg.add_button(label="複製網址", width=px(120),
-                                   callback=lambda s_=None, a_=None, u=url:
-                                   self.copy_text(u))
+                                   user_data=(url, status),
+                                   callback=lambda s_, a_, u:
+                                   self.copy_text(*u))
+                self.font(dpg.add_text("", tag=status, wrap=px(860),
+                                       color=LOOK.INK_2), "small")
+
+        # 缺的東西放最上面：第一次用的人一打開就要看到按鈕，不用往下捲
+        dpg.add_separator(parent="env_list")
+        self.font(dpg.add_text("全部的檢查結果", parent="env_list"), "strong")
+        rows = self.env_rows()
+        for item, state, note in rows:
+            with dpg.group(horizontal=True, parent="env_list"):
+                dpg.add_text(ENV.MARK.get(state, "     ").strip(),
+                             color=self.STATE_COLOR.get(state))
+                dpg.add_text("%-10s" % item)
+                dpg.add_text(note, wrap=px(620))
 
     def open_tools_dir(self):
         d = ENV.TOOLS_DIR
@@ -1907,21 +1942,46 @@ class App(object):
             return
         self.open_path(d)
 
-    def open_url(self, url):
-        import webbrowser
-        try:
-            webbrowser.open(url)
-        except Exception as e:
-            self.log("打不開 %s：%s" % (url, e))
-            self.copy_text(url)
+    def _say_near(self, status, msg, bad=False):
+        """把結果寫在按鈕旁邊（status 是那行字的 tag）；沒有的話寫進訊息區。"""
+        self.log(msg)
+        if status and dpg.does_item_exist(status):
+            dpg.set_value(status, msg)
+            dpg.configure_item(status, color=self.STATE_COLOR["bad"] if bad
+                               else LOOK.INK_2)
 
-    def copy_text(self, text):
+    def open_url(self, url, status=None):
+        err = None
+        try:
+            if os.name == "nt":
+                # 直接交給 Windows 用預設瀏覽器開，失敗會丟 OSError 而不是默默回 False
+                os.startfile(url)
+                opened = True
+            else:
+                import webbrowser
+                opened = webbrowser.open(url)
+        except Exception as e:
+            opened, err = False, e
+        if opened:
+            self._say_near(status, "已經用瀏覽器打開：%s" % url)
+            return
+        self._say_near(status, "打不開瀏覽器（%s），網址已經複製，貼到瀏覽器就好。"
+                       % (err or "找不到預設瀏覽器"), bad=True)
+        self.copy_text(url, status, quiet=True)
+
+    def copy_text(self, text, status=None, quiet=False):
         try:
             dpg.set_clipboard_text(text)
-            self.log("已複製：%s" % text)
-        except Exception:
-            # 舊版 Dear PyGui 沒有剪貼簿 API，至少把字留在訊息區讓人自己複製
-            self.log("複製不了，網址在這裡：%s" % text)
+        except Exception as e:
+            self._say_near(status, "複製不了（%s），請直接框選上面的網址按 Ctrl+C。"
+                           % e, bad=True)
+            return False
+        if not quiet:
+            first = text.splitlines()[0] if text else ""
+            self._say_near(status, "已複製：%s%s" % (
+                first, " …（共 %d 行）" % len(text.splitlines())
+                if "\n" in text else ""))
+        return True
 
     def log_env_check(self):
         """
@@ -4209,6 +4269,7 @@ def main():
         sys.exit(font_report())
     # 一定要在建立任何視窗之前，不然 Windows 會用點陣放大整張畫面（全糊）
     SCALE = enable_dpi_awareness()
+    set_taskbar_identity()
     App().run()
 
 

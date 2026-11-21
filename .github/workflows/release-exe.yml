@@ -1,0 +1,49 @@
+# 推一個 v 開頭的 tag（例如 v0.2.0）就會在 Windows 上做 bili-trim.exe，
+# 掛到同名的 GitHub Release 底下。Release 還沒有的話會順便建一個（草稿），
+# 說明自己去網頁上寫好再發佈。
+#
+# 手動重做某一版：Actions → release-exe → Run workflow，填 tag。
+name: release-exe
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要掛 exe 的 tag（例如 v0.2.0）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  exe:
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 裝套件
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: 做 exe
+        run: python setup.py --exe --yes
+
+      - name: 掛到 Release
+        shell: bash
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "$TAG" \
+              --notes "（說明還沒寫）"
+          fi
+          gh release upload "$TAG" dist/bili-trim.exe --clobber
