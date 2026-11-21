@@ -15,9 +15,8 @@ setup.py — 在一台新電腦上把這個專案弄到可以跑，一個命令�
 一句「找不到 adb」，而且看不出是哪一步錯。
 
 所以這裡把那些步驟收進一個檔案，而且刻意不碰 PATH —— 下載的工具放進
-專案的 tools/，由 bili_env.py 負責找（tools/ 優先，再找 PATH）。好處是
-整個專案資料夾可以直接複製到另一台電腦照樣能跑，也不會在使用者的系統
-環境變數裡留下東西。
+%LOCALAPPDATA%\bili_trim_gui\tools（exe 版也用這一份），由 bili_env.py
+負責找（那裡優先，再找 PATH），不會在使用者的系統環境變數裡留下東西。
 
 這個檔案只用標準庫，而且不 import 專案裡需要第三方套件的模組 ——
 它要能在「什麼都還沒裝」的電腦上跑起來。
@@ -35,7 +34,10 @@ import zipfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TOOLS = HERE / "tools"
+sys.path.insert(0, str(HERE))
+from bili_config import tools_dir  # noqa: E402  純標準庫，什麼都沒裝也讀得到
+
+TOOLS = tools_dir()     # %LOCALAPPDATA%\bili_trim_gui\tools，exe 和原始碼版共用
 UA = "bili-trim-setup"
 
 WIN = sys.platform == "win32"
@@ -249,8 +251,8 @@ def fetch_tool(urls, dest, basenames, label, size_hint):
     if not urls:
         warn("這個平台沒有自動下載的來源，請自己裝 %s" % label)
         return []
-    if not ask("要下載 %s 嗎？（%s，放進 tools/，不會動到 PATH）"
-               % (label, size_hint)):
+    if not ask("要下載 %s 嗎？（%s，放進 %s，不會動到 PATH）"
+               % (label, size_hint, TOOLS)):
         return []
     cache = TOOLS / "_download"
     cache.mkdir(parents=True, exist_ok=True)
@@ -354,10 +356,12 @@ def _version_line(exe, args):
 
 
 def check_tools(env):
+    for kind, ver in env.adopt_legacy_tools():
+        ok("把專案 tools/ 裡的 %s 複製到 %s（%s）" % (kind, TOOLS, ver))
     for name, label in (("adb", "Android platform-tools"), ("ffmpeg", "ffmpeg")):
         p = env.find(name, refresh=True)
         if p:
-            where = "tools/" if str(p).startswith(str(TOOLS)) else "PATH"
+            where = "tools" if str(p).startswith(str(TOOLS)) else "PATH"
             ok("%s 已經有了：%s（%s）" % (name, p, where))
             continue
         warn("還沒有 %s（%s 這一包）" % (name, label))
@@ -775,8 +779,10 @@ def setup_config():
 # 打包
 # --------------------------------------------------------------------------- #
 
+# 專案裡舊的 tools/ 不包：工具一律從 TOOLS（AppData）那份拿，見 pack()
 SKIP_DIRS = {"__pycache__", "bili_gui_stage", "bili_trim_stage", "preview",
-             ".git", ".venv", "_download", "build", "dist", ".impeccable"}
+             ".git", ".venv", "_download", "build", "dist", ".impeccable",
+             "tools"}
 SKIP_SUFFIX = (".bilibak", ".part", ".pyc", ".lnk", ".log", ".zip")
 
 # python-path.txt 記的是「打包那台電腦」的 Python 路徑，帶過去會指到
@@ -795,9 +801,6 @@ def pack(out, with_tools=True):
             dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
             rp = Path(root)
             rel_root = rp.relative_to(HERE)
-            if not with_tools and rel_root.parts[:1] == ("tools",):
-                dirs[:] = []
-                continue
             for f in files:
                 src = rp / f
                 if f.lower().endswith(SKIP_SUFFIX) or f in SKIP_NAMES:
@@ -805,6 +808,23 @@ def pack(out, with_tools=True):
                 z.write(str(src), str(rel_root / f))
                 n += 1
                 total += src.stat().st_size
+        # AppData 裡的工具放進包裡的 tools/：新電腦上開程式時會自己複製回
+        # 那台的 AppData（bili_env.adopt_legacy_tools）
+        packed_tools = []
+        if with_tools and TOOLS.is_dir():
+            for root, dirs, files in os.walk(str(TOOLS)):
+                dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                rp = Path(root)
+                for f in files:
+                    if f.lower().endswith(SKIP_SUFFIX) or f.startswith("_"):
+                        continue
+                    src = rp / f
+                    z.write(str(src), str(Path("tools") / rp.relative_to(TOOLS) / f))
+                    n += 1
+                    total += src.stat().st_size
+                    stem = f.lower().rsplit(".", 1)[0]
+                    if stem in ("adb", "ffmpeg") and stem not in packed_tools:
+                        packed_tools.append(stem)
     say("%d 個檔案，原始 %s，壓成 %s"
         % (n, _human(total), _human(out.stat().st_size)))
     ok("包好了：%s" % out)
@@ -812,9 +832,11 @@ def pack(out, with_tools=True):
     print("帶到新電腦之後，在那邊解壓，然後：")
     print("    Windows   點兩下 bili-trim.bat")
     print("    其他系統  python3 setup.py")
-    if with_tools and (HERE / "tools").is_dir():
+    if packed_tools:
         print("")
-        print("（tools/ 一起包進去了，所以新電腦不必再下載 adb 跟 ffmpeg）")
+        print("（%s 一起包進 tools/ 了，新電腦第一次開程式時會自己裝好，"
+              % " 跟 ".join(packed_tools))
+        print("  不必再下載）")
 
 
 # --------------------------------------------------------------------------- #
@@ -830,8 +852,8 @@ def build_exe(env):
     封成一個 exe。對方的電腦不用裝 Python。
 
     adb 和 ffmpeg 不封進去：ffmpeg 常見的 Windows 建置是 GPL，platform-tools
-    有自己的條款，跟本專案的 MIT 不能混在一個檔案裡散佈。exe 會在它旁邊的
-    tools/ 找，找不到再看 PATH —— 跟原始碼版一樣。
+    有自己的條款，跟本專案的 MIT 不能混在一個檔案裡散佈。exe 會在
+    %LOCALAPPDATA%\bili_trim_gui\tools 找，找不到再看 PATH —— 跟原始碼版一樣。
     """
     if os.name != "nt":
         warn("exe 只做 Windows 版。其他系統用 python3 run.py 就好。")
@@ -875,11 +897,11 @@ def build_exe(env):
     print("")
     print("拿去用的時候：")
     print("    1. 把 %s 放到任何資料夾（不要放 Program Files，那裡寫不進去）" % exe.name)
-    print("    2. adb 和 ffmpeg：已經在 PATH 裡就不用管；沒有的話在 exe 旁邊建一個")
-    print("       tools 資料夾，把 adb.exe（連同兩個 dll）和 ffmpeg / ffplay / ffprobe 放進去")
-    print("    3. 點兩下 %s" % exe.name)
+    print("    2. 點兩下 %s" % exe.name)
+    print("    3. adb 和 ffmpeg：已經在 PATH 裡就不用管；沒有的話把下載好的 zip")
+    print("       拖進視窗，會裝到 %LOCALAPPDATA%\\bili_trim_gui\\tools")
     print("")
-    print("剪輯時從手機拉下來的暫存會放在 exe 旁邊的 bili_gui_stage 資料夾。")
+    print("剪輯時從手機拉下來的暫存放在 %LOCALAPPDATA%\\bili_trim_gui\\stage。")
     return 0
 
 
@@ -991,7 +1013,7 @@ def main():
     ap.add_argument("--pack", nargs="?", const="bili-trim-portable.zip",
                     metavar="ZIP", help="打包成一個 zip 帶去別台電腦")
     ap.add_argument("--no-tools", action="store_true",
-                    help="--pack 時不要把 tools/ 包進去")
+                    help="--pack 時不要把 adb / ffmpeg 包進去")
     ap.add_argument("--exe", action="store_true",
                     help="做成一個 exe（不用裝 Python 就能跑）")
     ap.add_argument("--backup-dir", metavar="PATH",
@@ -1080,5 +1102,5 @@ if __name__ == "__main__":
         sys.exit(main())
     except KeyboardInterrupt:
         print("")
-        print("中斷了。再跑一次會接著做 —— 下載好的檔案留在 tools/_download。")
+        print("中斷了。再跑一次會接著做 —— 下載好的檔案留在 %s。" % (TOOLS / "_download"))
         sys.exit(130)

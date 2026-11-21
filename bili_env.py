@@ -11,12 +11,12 @@ bili_env.py — 找外部工具（adb / ffmpeg / ffplay / ffprobe）。
 所以查找順序改成：
 
     1. 環境變數指名（BILI_ADB / BILI_FFMPEG …）
-    2. 專案自己的 tools/ 資料夾
+    2. %LOCALAPPDATA%\bili_trim_gui\tools（exe 和原始碼版共用這一份）
     3. PATH
 
-setup.py 會把下載好的 platform-tools 與 ffmpeg 放進 tools/，於是 PATH
-完全不用動，而且整個專案資料夾可以直接複製到另一台電腦照樣能跑。
-已經把 adb／ffmpeg 加進 PATH 的人也不受影響 —— 第 3 步就會找到。
+把下載好的 zip 拖進程式視窗（install_from），或跑 setup.py，工具就會放進
+第 2 步那個資料夾，PATH 完全不用動。已經把 adb／ffmpeg 加進 PATH 的人
+也不受影響 —— 第 3 步就會找到。
 """
 
 import json
@@ -24,6 +24,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 # 版本號放這裡：bili_env 是唯一一個每個模組都會載入的共用檔案。
@@ -33,11 +34,17 @@ VERSION = "0.1.0"
 HERE = Path(__file__).resolve().parent
 
 # 打包成 exe（PyInstaller）的時候，原始碼被解到一個暫存資料夾，每次開都不一樣、
-# 關掉就刪掉。tools/、暫存影片這些要跟著「exe 放在哪」走，不能跟著 __file__。
+# 關掉就刪掉，所以 tools 不能跟著 __file__。exe 和原始碼版都用
+# %LOCALAPPDATA%\bili_trim_gui\tools（見 bili_config.tools_dir）。
 FROZEN = bool(getattr(sys, "frozen", False))
-APP_DIR = Path(sys.executable).resolve().parent if FROZEN else HERE
 
-TOOLS_DIR = Path(os.environ.get("BILI_TOOLS") or (APP_DIR / "tools"))
+from bili_config import tools_dir as _tools_dir  # noqa: E402
+
+TOOLS_DIR = _tools_dir()
+
+# 舊版把工具放在專案裡的 tools/（setup.py 下載的、--pack 帶過來的）。
+# 開程式時會把它複製進 TOOLS_DIR（adopt_legacy_tools），之後就只看 TOOLS_DIR。
+LEGACY_TOOLS_DIR = HERE / "tools"
 
 # 每個工具：環境變數名、是否必要、缺了會怎樣
 TOOLS = {
@@ -51,17 +58,18 @@ TOOLS = {
                 "讀不到影片的長寬與時長，預覽會不能用"),
 }
 
-# 缺工具時要告訴使用者去哪裡拿、拿到之後放哪裡。刻意指向官方頁面而不是
-# 直接的檔案連結 —— 連結會過期，頁面不會。
+# 缺工具時要告訴使用者去哪裡拿、拿到之後放哪裡。adb 指向官方頁面（要先同意
+# 條款才能下載）。ffmpeg 官網沒有下載按鈕、只有一排第三方建置的連結，第一次
+# 用的人會迷路，所以 Windows 直接給 gyan.dev 的 release-essentials.zip
+# （ffmpeg.org 列的建置；這個檔名永遠指向最新的正式版，不會過期）。
 DOWNLOADS = {
     "adb": ("Android SDK Platform-Tools",
             "https://developer.android.com/tools/releases/platform-tools",
-            "解壓後把 adb.exe 和它旁邊的 AdbWinApi.dll、AdbWinUsbApi.dll "
-            "三個檔案一起放進 tools/"),
+            "下載好的 zip 拖進程式視窗就會裝好（不用解壓縮）"),
     "ffmpeg": ("ffmpeg",
-               "https://ffmpeg.org/download.html",
-               "挑一個包含 ffmpeg／ffplay／ffprobe 的建置，解壓後把這三個"
-               "執行檔放進 tools/"),
+               "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+               if os.name == "nt" else "https://ffmpeg.org/download.html",
+               "下載好的 zip 拖進程式視窗就會裝好（不用解壓縮）"),
 }
 DOWNLOADS["ffplay"] = DOWNLOADS["ffmpeg"]
 DOWNLOADS["ffprobe"] = DOWNLOADS["ffmpeg"]
@@ -165,6 +173,189 @@ def missing_hint(name):
     if not FROZEN:      # exe 版旁邊沒有 setup.py，也不一定有 Python
         text += "\n（也可以跑 python setup.py，它會問要不要幫你下載。）"
     return text
+
+
+# --------------------------------------------------------------------------- #
+# 從使用者下載好的壓縮檔（或解開的資料夾）裝工具
+# --------------------------------------------------------------------------- #
+
+_WIN = os.name == "nt"
+
+# 一包要拿哪些檔案。adb.exe 不能單獨搬 —— 兩個 dll 要躺在它旁邊，不然一執行
+# 就是缺模組；ffmpeg 那包只要三個執行檔，其他（文件、授權、dll 都沒有）不用。
+PACKS = (
+    ("adb", ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"] if _WIN
+     else ["adb"], ["version"]),
+    ("ffmpeg", ["ffmpeg.exe", "ffplay.exe", "ffprobe.exe"] if _WIN
+     else ["ffmpeg", "ffplay", "ffprobe"], ["-version"]),
+)
+
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _WIN else 0
+
+
+class InstallError(Exception):
+    pass
+
+
+def _index_dir(root):
+    """資料夾裡 {小寫檔名: Path}，同名取路徑最短的；最多往下 4 層。"""
+    out = {}
+    base = len(root.parts)
+    for r, dirs, files in os.walk(root):
+        rp = Path(r)
+        if len(rp.parts) - base >= 4:
+            dirs[:] = []
+        for f in files:
+            k = f.lower()
+            cand = rp / f
+            if k not in out or len(cand.parts) < len(out[k].parts):
+                out[k] = cand
+    return out
+
+
+def install_from(path, log=lambda s: None):
+    """
+    把拖進來的東西裝進 tools/，回傳裝好的 [(工具, 版本那一行)]。
+    可以是：下載好的 zip、已經解開的資料夾、或資料夾裡的 adb.exe 本身。
+    出錯丟 InstallError，訊息是直接給使用者看的一句話。
+
+    只挑需要的檔案平鋪寫進 tools/（不整包解開）：輸出路徑是這裡自己組的，
+    壓縮檔裡寫 ../../ 也影響不到別的地方。zipfile 讀每個檔案時會核對 CRC，
+    沒下載完或壞掉的檔案在這一步就會被擋下來。
+    """
+    src = Path(path)
+    if not src.exists():
+        raise InstallError("找不到這個檔案：%s" % src)
+    names = set(n.lower() for _, files, _ in PACKS for n in files)
+    if src.is_file() and src.name.lower() in names:
+        src = src.parent            # 拖的是 adb.exe 本身：拿它旁邊的檔案
+
+    z = None
+    if src.is_dir():
+        index = _index_dir(src)
+    elif zipfile.is_zipfile(str(src)):
+        z = zipfile.ZipFile(str(src))
+        index = {}
+        for info in z.infolist():
+            if info.filename.endswith("/"):
+                continue
+            k = info.filename.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            depth = info.filename.count("/")
+            if k not in index or depth < index[k].filename.count("/"):
+                index[k] = info
+    elif src.suffix.lower() == ".zip":
+        raise InstallError("%s 壞了或還沒下載完，重新下載一次。" % src.name)
+    elif src.suffix.lower() in (".7z", ".rar", ".xz", ".gz"):
+        raise InstallError("%s 是 %s 格式，請改下載 .zip 的版本。"
+                           % (src.name, src.suffix))
+    else:
+        raise InstallError("%s 不是壓縮檔。請拖下載好的 .zip。" % src.name)
+
+    try:
+        todo = [(kind, files, args) for kind, files, args in PACKS
+                if files[0].lower() in index]
+        if not todo:
+            raise InstallError("%s 裡面沒有 adb 也沒有 ffmpeg，是不是拖錯檔案了？"
+                               % src.name)
+        try:
+            TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise InstallError("建不出 tools 資料夾（%s）：%s" % (TOOLS_DIR, e))
+
+        done = []
+        for kind, files, args in todo:
+            lack = [f for f in files if f.lower() not in index]
+            if kind == "adb" and lack:
+                raise InstallError("這包 adb 不完整，少了 %s。重新下載一次。"
+                                   % "、".join(lack))
+            log("正在放進 tools：%s" % kind)
+            for f in files:
+                if f.lower() not in index:
+                    continue        # ffplay 缺了只是預覽沒聲音，不擋
+                _write_one(z, index[f.lower()], TOOLS_DIR / f, kind)
+            exe = TOOLS_DIR / files[0]
+            try:
+                r = subprocess.run([str(exe)] + args, capture_output=True,
+                                   timeout=30, creationflags=_NO_WINDOW)
+                line = r.stdout.decode("utf-8", "replace").strip().splitlines()
+            except (OSError, subprocess.SubprocessError) as e:
+                raise InstallError("放好了，但 %s 跑不起來：%s" % (kind, e))
+            if r.returncode or not line:
+                raise InstallError("放好了，但 %s 跑不起來（結束碼 %s）。"
+                                   % (kind, r.returncode))
+            done.append((kind, line[0]))
+    finally:
+        if z is not None:
+            z.close()
+    for name in TOOLS:
+        find(name, refresh=True)
+    return done
+
+
+def adopt_legacy_tools():
+    """
+    專案 tools/ 裡有、TOOLS_DIR 裡還沒有的工具，複製一份過去（原本的不刪）。
+    回傳裝好的 [(工具, 版本那一行)]；沒有要搬的就是 []。
+    """
+    old = LEGACY_TOOLS_DIR
+    if FROZEN or not old.is_dir() or _under(old, TOOLS_DIR) \
+            or _under(TOOLS_DIR, old):
+        return []
+    lacking = [kind for kind, files, _ in PACKS
+               if not (TOOLS_DIR / files[0]).is_file()]
+    if not lacking:
+        return []
+    have = _index_dir(old)
+    if not any(files[0].lower() in have for kind, files, _ in PACKS
+               if kind in lacking):
+        return []
+    try:
+        return install_from(old)
+    except InstallError:
+        return []           # 舊的那份壞了就算了，照一般「缺工具」的流程走
+
+
+def _write_one(z, item, out, kind):
+    tmp = out.with_name(out.name + ".part")
+    try:
+        if z is not None:
+            with z.open(item) as src, open(str(tmp), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        else:
+            shutil.copyfile(str(item), str(tmp))
+    except zipfile.BadZipFile:
+        _unlink(tmp)
+        raise InstallError("壓縮檔壞了（%s 核對不過），重新下載一次。" % out.name)
+    except OSError as e:
+        _unlink(tmp)
+        raise InstallError("寫不進 tools 資料夾：%s" % e)
+    try:
+        os.replace(str(tmp), str(out))
+    except PermissionError:
+        # 舊的 adb.exe 還在跑（adb 會留一個背景 server），先請它停下來再換
+        if kind == "adb" and out.is_file():
+            try:
+                subprocess.run([str(out), "kill-server"], capture_output=True,
+                               timeout=15, creationflags=_NO_WINDOW)
+                os.replace(str(tmp), str(out))
+                return
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _unlink(tmp)
+        raise InstallError("%s 正在使用中，換不掉。關掉用到它的程式再試一次。"
+                           % out.name)
+    if not _WIN:
+        try:
+            os.chmod(str(out), 0o755)
+        except OSError:
+            pass
+
+
+def _unlink(p):
+    try:
+        p.unlink()
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -283,7 +474,7 @@ def check():
     for name, (_, need, why) in TOOLS.items():
         p = find(name, refresh=True)
         if p:
-            where = "tools/" if _under(p, TOOLS_DIR) else "PATH"
+            where = "tools" if _under(p, TOOLS_DIR) else "PATH"
             rows.append((name, "ok", "%s  （%s）" % (p, where)))
         else:
             rows.append((name, "bad" if need else "warn", "沒有 —— " + why))

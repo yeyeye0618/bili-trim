@@ -17,9 +17,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# exe 版的暫存影片放在 exe 旁邊（原始碼被解到暫存資料夾，放那裡會被刪掉）
-APP_DIR = (Path(sys.executable).resolve().parent
-           if getattr(sys, "frozen", False) else HERE)
+FROZEN = bool(getattr(sys, "frozen", False))
 
 DEFAULT_FONT_PT = 17
 
@@ -32,11 +30,36 @@ def config_dir():
     return Path(base) / "bili_trim_gui"
 
 
+def local_dir():
+    """
+    大的、不用跟著帳號漫遊的東西：%LOCALAPPDATA%\\bili_trim_gui。
+    exe 可能就躺在桌面或「下載」，不能在它旁邊長出一堆資料夾；
+    原始碼被解到暫存資料夾，也不能放那裡。
+    """
+    if os.name == "nt":
+        base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+                or str(Path.home()))
+    else:
+        base = (os.environ.get("XDG_DATA_HOME")
+                or str(Path.home() / ".local" / "share"))
+    return Path(base) / "bili_trim_gui"
+
+
+def tools_dir():
+    """
+    adb / ffmpeg 放這裡。exe 和原始碼版共用同一份：在哪個版本裝的，
+    另一個版本都找得到。BILI_TOOLS 可以改指別的資料夾。
+    """
+    return Path(os.environ.get("BILI_TOOLS") or (local_dir() / "tools"))
+
+
 CONFIG_PATH = config_dir() / "settings.json"
 
 DEFAULTS = {
     "backup_dir": str(Path.home() / "Documents" / "bili_backups"),
-    "stage_dir": str(APP_DIR / "bili_gui_stage"),
+    # 暫存影片：原始碼版照舊放在專案裡，exe 版放 %LOCALAPPDATA%
+    "stage_dir": str(local_dir() / "stage" if FROZEN
+                     else HERE / "bili_gui_stage"),
     "preview_quality": "原生解析度",
     "font_pt": DEFAULT_FONT_PT,
     "snap": "outer",
