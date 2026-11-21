@@ -45,6 +45,13 @@ DEFAULTS = {
     "force_stop_after_write": True,
     "window": None,
     "window_dpi": None,
+    # 用 Wi-Fi 連上過的手機 IP：重新掃描時會順手幫它們重新連線
+    "wifi_hosts": [],
+    # 最後一次用 Wi-Fi 連上的 IP:埠號。網路上找不到手機（有些網路或防火牆擋掉
+    # 區網廣播）的時候，至少先試這一組 —— 手機沒重開的話埠號不會變
+    "wifi_last": "",
+    # IP -> 手機型號，「找手機」列表顯示用
+    "wifi_names": {},
 }
 
 
