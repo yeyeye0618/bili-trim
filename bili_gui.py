@@ -41,6 +41,7 @@ import bili_backup as BK
 import bili_config as CFG
 import bili_device as DEV
 import bili_env as ENV
+import bili_drop as DROP
 import bili_font as BF
 import bili_look as LOOK
 import bili_media as MED
@@ -349,6 +350,8 @@ class App(object):
         self._native = (0, 0)
         self._adb_label = "adb 檢查中…"
         self._ff_label = ""
+        self._env_note_val = ("", False, None)   # 環境檢查視窗底下那行字
+        self._installing = False
         self._stage_note = ""
         self.ui_q = queue.Queue()
         self.busy = False
@@ -1674,6 +1677,17 @@ class App(object):
             dpg.add_file_extension(BK.EXT, color=LOOK.OK)
             dpg.add_file_extension(".*")
 
+        with dpg.file_dialog(directory_selector=False, show=False, modal=True,
+                             tag="dlg_tool_zip", width=px(760), height=px(460),
+                             # 只是起始位置：沒有「下載」資料夾就從預設的地方開
+                             default_path=next((str(d) for d in
+                                                [Path.home() / "Downloads"]
+                                                if d.is_dir()), ""),
+                             callback=lambda s_, a_: self.install_tools(
+                                 [a_.get("file_path_name")])):
+            dpg.add_file_extension(".zip", color=LOOK.OK)
+            dpg.add_file_extension(".*")
+
         with dpg.window(label="還原備份", tag="win_restore", show=False,
                         modal=True, width=px(940), height=px(520)):
             with dpg.group(horizontal=True):
@@ -1710,21 +1724,17 @@ class App(object):
                                callback=lambda: dpg.hide_item("win_confirm"))
 
         with dpg.window(label="環境檢查", tag="win_env", show=False,
-                        modal=True, width=px(900), height=px(560)):
-            dpg.add_text(
-                "這個程式需要兩個外部程式：adb（連手機）和 ffmpeg（預覽畫面）。"
-                "把它們放進專案的 tools/ 資料夾就好，不用改系統的 PATH；"
-                "已經加進 PATH 的也找得到。", wrap=px(870))
-            dpg.add_separator()
-            with dpg.child_window(height=px(-96), tag="env_list"):
+                        modal=True, width=px(720), height=px(400)):
+            dpg.add_text("這個工具需要 adb（連手機）和 ffmpeg（預覽畫面）。",
+                         wrap=px(680))
+            dpg.add_spacer(height=px(4))
+            # 有框的這一塊就是「拖到這裡」的地方（其實整個視窗都收得到）
+            with dpg.child_window(height=px(-52), tag="env_list", border=True):
                 pass
-            dpg.add_separator()
             with dpg.group(horizontal=True):
                 dpg.add_button(label="重新檢查", width=px(120),
-                               callback=self.fill_env_window)
-                dpg.add_button(label="開啟 tools 資料夾", width=px(190),
-                               callback=self.open_tools_dir)
-                dpg.add_button(label="把結果寫進訊息", width=px(190),
+                               callback=self.recheck_tools)
+                dpg.add_button(label="把詳細結果寫進訊息", width=px(210),
                                callback=self.log_env_check)
                 dpg.add_button(label="關閉", width=px(96),
                                callback=lambda: dpg.hide_item("win_env"))
@@ -1788,15 +1798,10 @@ class App(object):
 
     def startup(self):
         self._sync_backup_label()
-        ok, msg = DEV.check_adb()
-        m = re.search(r"version\s+([\d.]+)", msg)
-        if ok:
-            self._adb_label = "adb %s" % m.group(1) if m else "adb 可用"
-        else:
-            self._adb_label = "找不到 adb"
-        self._ff_label = "ffmpeg 檢查中…" if MED.have_ffmpeg() else "找不到 ffmpeg"
-        self._sync_footer()
-        self._probe_ffmpeg()
+        for kind, ver in ENV.adopt_legacy_tools():
+            self.log("把專案 tools/ 裡的 %s 複製到 %s（%s）"
+                     % (kind, ENV.TOOLS_DIR, ver))
+        ok, msg = self._sync_tool_labels()
         self.log("%s v%s 啟動" % (APP_NAME, ENV.VERSION))
         self.log("adb：%s" % msg)
         if not MED.have_ffmpeg() or not MED.have_ffplay():
@@ -1814,6 +1819,68 @@ class App(object):
         # 的視窗開出來，不然使用者只會看到一個什麼都不能按的介面。
         if not ok or not MED.have_ffmpeg():
             self.show_env_window()
+
+    def _sync_tool_labels(self):
+        """重新看 adb / ffmpeg 在不在，更新底列。回傳 DEV.check_adb() 的結果。"""
+        ok, msg = DEV.check_adb()
+        m = re.search(r"version\s+([\d.]+)", msg)
+        if ok:
+            self._adb_label = "adb %s" % m.group(1) if m else "adb 可用"
+        else:
+            self._adb_label = "找不到 adb"
+        self._ff_label = "ffmpeg 檢查中…" if MED.have_ffmpeg() else "找不到 ffmpeg"
+        self._sync_footer()
+        self._probe_ffmpeg()
+        return ok, msg
+
+    def recheck_tools(self):
+        """自己放好檔案、或拖進來裝好之後：重新找一次，能連手機就去掃。"""
+        had_adb = ENV.have("adb")
+        for n in ENV.TOOLS:
+            ENV.find(n, refresh=True)
+        ok, _ = self._sync_tool_labels()
+        self.sync_enabled()
+        self.fill_env_window()
+        if ok and not had_adb:
+            self.refresh_all()
+
+    def on_files_dropped(self, paths):
+        """從檔案總管拖進視窗的檔案。這個程式只收一種東西：工具的壓縮檔。"""
+        if paths:
+            self.install_tools(paths)
+
+    def install_tools(self, paths):
+        paths = [p for p in paths if p]
+        if not paths:
+            return
+        if self._installing:
+            self._env_note("上一包還在處理，等它好了再拖。")
+            return
+        if not dpg.is_item_shown("win_env"):
+            self.show_env_window()
+        self._installing = True
+        self._env_note("正在檢查 %s…" % Path(paths[0]).name)
+
+        def work():
+            done, err = [], None
+            for p in paths:
+                try:
+                    done += ENV.install_from(p)
+                except ENV.InstallError as e:
+                    err = str(e)
+                except Exception as e:
+                    err = "裝的時候出錯：%s" % e
+
+            def finish():
+                self._installing = False
+                self.recheck_tools()
+                if err:
+                    self._env_note(err, bad=True)
+                elif done:
+                    self._env_note("裝好了：%s。" % "、".join(
+                        "%s（%s）" % (k, v) for k, v in done))
+            self.post(finish)
+        threading.Thread(target=work, name="install-tools", daemon=True).start()
 
     def _probe_ffmpeg(self):
         """底列要寫 ffmpeg 的版本；問一次要幾十毫秒，丟到背景。"""
@@ -1867,90 +1934,72 @@ class App(object):
         rows.append(("字型", ) + ENV.font_state())
         return rows
 
+    def _missing_kinds(self):
+        """缺哪幾包：adb、ffmpeg（ffmpeg/ffplay/ffprobe 是同一包）。"""
+        out = []
+        if not ENV.have("adb"):
+            out.append("adb")
+        if not (MED.have_ffmpeg() and MED.have_ffplay()):
+            out.append("ffmpeg")
+        return out
+
     def fill_env_window(self):
         """
-        把 ENV.check() 的結果畫出來，缺的東西再補一段「去哪裡拿、放哪裡」。
-        看程式碼的人不會知道要點什麼，所以這裡要把下一步講完 ——
-        連結、資料夾、重新檢查都做成按鈕。
+        只講兩件事：這個工具要 adb 和 ffmpeg、現在缺哪個。缺的就叫人把下載好
+        的壓縮檔拖進來 —— 解壓、挑檔案、放哪個資料夾都是程式的事，不是使用者的。
+        各項的詳細狀態在「把詳細結果寫進訊息」。
         """
         dpg.delete_item("env_list", children_only=True)
+        P = "env_list"
+        kinds = self._missing_kinds()
+        dpg.add_spacer(height=px(6), parent=P)
+        if not kinds:
+            dpg.add_text("adb 和 ffmpeg 都在了。接上手機，按左下角的「重新掃描手機」"
+                         "就能開始。", parent=P, wrap=px(640),
+                         color=self.STATE_COLOR["ok"])
+        else:
+            self.font(dpg.add_text("缺少 %s" % " 和 ".join(kinds), parent=P),
+                      "strong")
+            what = kinds[0] + " " if len(kinds) == 1 else ""
+            line = "下載好 %s壓縮檔後，拖曳到這個視窗（不用解壓縮）。" % what
+            if kinds == ["ffmpeg"]:
+                line = "沒有它也能剪，只是看不到預覽畫面。" + line
+            dpg.add_text(line, parent=P, wrap=px(640))
+            dpg.add_spacer(height=px(6), parent=P)
+            with dpg.group(horizontal=True, parent=P):
+                for k in kinds:
+                    dpg.add_button(label="下載 %s" % k, width=px(130),
+                                   user_data=ENV.DOWNLOADS[k][1],
+                                   callback=lambda s_, a_, u: self.open_url(
+                                       u, note=True))
+                dpg.add_button(label="選擇檔案…", width=px(130),
+                               callback=lambda: dpg.show_item("dlg_tool_zip"))
+        dpg.add_spacer(height=px(6), parent=P)
+        self.font(dpg.add_text("", tag="env_note", parent=P, wrap=px(640),
+                               color=LOOK.INK_2), "small")
+        t = dpg.add_input_text(tag="env_note_sel", parent=P, readonly=True,
+                               width=px(640), show=False)
+        self.font(t, "small")
+        self._draw_env_note()
 
-        missing = [n for n in ("adb", "ffmpeg", "ffplay", "ffprobe")
-                   if not ENV.have(n)]
-        if not missing:
-            dpg.add_text("兩個外部程式都在，接上手機按「重新掃描」就可以開始。",
-                         parent="env_list", color=self.STATE_COLOR["ok"],
-                         wrap=px(860))
-
-        # 同一包的只講一次（ffmpeg / ffplay / ffprobe 是一起下載的）
-        shown = set()
-        for name in missing:
-            label, url, howto = ENV.DOWNLOADS[name]
-            if label in shown:
-                continue
-            if shown:
-                dpg.add_separator(parent="env_list")
-            shown.add(label)
-            with dpg.group(parent="env_list"):
-                dpg.add_text("缺 %s" % label, color=self.STATE_COLOR["bad"])
-                same = [n for n in missing if ENV.DOWNLOADS[n][0] == label]
-                dpg.add_text("少了：%s" % "、".join(same), wrap=px(860))
-                for n in same:
-                    dpg.add_text("    %s —— %s" % (n, ENV.TOOLS[n][2]),
-                                 wrap=px(840))
-                # 網址放在唯讀輸入框裡：按鈕都失靈的時候，還能自己框選、Ctrl+C
-                with dpg.group(horizontal=True):
-                    dpg.add_text("下載：")
-                    t = dpg.add_input_text(default_value=url, readonly=True,
-                                           width=px(780))
-                    self.font(t, "small")
-                dpg.add_text("放法：%s" % howto, wrap=px(860))
-                dpg.add_text("tools 資料夾在：%s（按下面的「開啟 tools 資料夾」，"
-                             "沒有的話會幫你建）" % ENV.TOOLS_DIR, wrap=px(860))
-                status = dpg.generate_uuid()
-                # Dear PyGui 呼叫按鈕回呼時固定傳 (sender, app_data, user_data)，
-                # 網址要放 user_data —— 寫成 lambda 的預設參數會被第三個引數蓋成 None
-                with dpg.group(horizontal=True):
-                    dpg.add_button(label="開啟下載頁", width=px(140),
-                                   user_data=(url, status),
-                                   callback=lambda s_, a_, u:
-                                   self.open_url(*u))
-                    dpg.add_button(label="複製網址", width=px(120),
-                                   user_data=(url, status),
-                                   callback=lambda s_, a_, u:
-                                   self.copy_text(*u))
-                self.font(dpg.add_text("", tag=status, wrap=px(860),
-                                       color=LOOK.INK_2), "small")
-
-        # 缺的東西放最上面：第一次用的人一打開就要看到按鈕，不用往下捲
-        dpg.add_separator(parent="env_list")
-        self.font(dpg.add_text("全部的檢查結果", parent="env_list"), "strong")
-        rows = self.env_rows()
-        for item, state, note in rows:
-            with dpg.group(horizontal=True, parent="env_list"):
-                dpg.add_text(ENV.MARK.get(state, "     ").strip(),
-                             color=self.STATE_COLOR.get(state))
-                dpg.add_text("%-10s" % item)
-                dpg.add_text(note, wrap=px(620))
-
-    def open_tools_dir(self):
-        d = ENV.TOOLS_DIR
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            self.log("建不出 %s：%s" % (d, e))
-            return
-        self.open_path(d)
-
-    def _say_near(self, status, msg, bad=False):
-        """把結果寫在按鈕旁邊（status 是那行字的 tag）；沒有的話寫進訊息區。"""
+    def _env_note(self, msg, bad=False, select=None):
+        """環境檢查視窗裡的那行回應（也寫進訊息區）。select：可框選複製的字。"""
         self.log(msg)
-        if status and dpg.does_item_exist(status):
-            dpg.set_value(status, msg)
-            dpg.configure_item(status, color=self.STATE_COLOR["bad"] if bad
-                               else LOOK.INK_2)
+        self._env_note_val = (msg, bad, select)
+        self._draw_env_note()
 
-    def open_url(self, url, status=None):
+    def _draw_env_note(self):
+        if not dpg.does_item_exist("env_note"):
+            return
+        msg, bad, select = self._env_note_val
+        dpg.set_value("env_note", msg)
+        dpg.configure_item("env_note", color=self.STATE_COLOR["bad"] if bad
+                           else LOOK.INK_2)
+        dpg.configure_item("env_note_sel", show=bool(select))
+        if select:
+            dpg.set_value("env_note_sel", select)
+
+    def open_url(self, url, note=False):
         err = None
         try:
             if os.name == "nt":
@@ -1963,22 +2012,27 @@ class App(object):
         except Exception as e:
             opened, err = False, e
         if opened:
-            self._say_near(status, "已經用瀏覽器打開：%s" % url)
+            if note:
+                self._env_note("已經用瀏覽器打開下載頁。")
             return
-        self._say_near(status, "打不開瀏覽器（%s），網址已經複製，貼到瀏覽器就好。"
-                       % (err or "找不到預設瀏覽器"), bad=True)
-        self.copy_text(url, status, quiet=True)
+        copied = self.copy_text(url, quiet=True)
+        msg = "打不開瀏覽器（%s）。%s" % (
+            err or "找不到預設瀏覽器",
+            "網址已經複製，貼到瀏覽器就好：" if copied else "請複製這個網址：")
+        if note:
+            self._env_note(msg, bad=True, select=url)
+        else:
+            self.log(msg + url)
 
-    def copy_text(self, text, status=None, quiet=False):
+    def copy_text(self, text, quiet=False):
         try:
             dpg.set_clipboard_text(text)
         except Exception as e:
-            self._say_near(status, "複製不了（%s），請直接框選上面的網址按 Ctrl+C。"
-                           % e, bad=True)
+            self.log("複製不了（%s）。" % e)
             return False
         if not quiet:
             first = text.splitlines()[0] if text else ""
-            self._say_near(status, "已複製：%s%s" % (
+            self.log("已複製：%s%s" % (
                 first, " …（共 %d 行）" % len(text.splitlines())
                 if "\n" in text else ""))
         return True
@@ -2358,6 +2412,10 @@ class App(object):
 
     @property
     def stage_dir(self):
+        # 設定檔是原始碼版和 exe 共用的，裡面記的可能是另一個版本（或舊版 exe
+        # 放在自己旁邊）的位置。exe 一律用自己的 %LOCALAPPDATA%\bili_trim_gui\stage。
+        if ENV.FROZEN:
+            return Path(CFG.DEFAULTS["stage_dir"])
         return Path(self.cfg["stage_dir"])
 
     # ======================================================================= #
@@ -3951,6 +4009,7 @@ class App(object):
 
         for tag in ("root", "dlg_backup_dir", "dlg_backup_file", "win_restore",
                     "win_confirm", "win_help", "win_env", "win_log", "win_wifi",
+                    "dlg_tool_zip",
                     "pop_dev",
                     "pop_backup", "pop_settings", "pop_help", "preview_tex",
                     "tex_reg"):
@@ -4084,6 +4143,10 @@ class App(object):
         dpg.set_viewport_clear_color(LOOK.PAPER)
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        # 檔案總管拖進來的壓縮檔（環境檢查的「拖曳到這個視窗」）
+        if not DROP.install(title, lambda files: self.post(
+                lambda: self.on_files_dropped(files))):
+            self.log("這台電腦上沒辦法把檔案拖進視窗；請用環境檢查裡的「選擇檔案」。")
         if not self.font_files.get("body"):
             self.log("找不到中文字型，介面上的中文會顯示不出來。")
         else:

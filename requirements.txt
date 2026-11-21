@@ -10,5 +10,5 @@ fonttools>=4.40
 #   adb     Android SDK Platform-Tools，必要
 #   ffmpeg  只有預覽畫面與匯出接縫片段需要（ffplay 負責預覽的聲音）
 #
-# 這兩個不用自己弄，也不用改 PATH —— 跑 python setup.py 會下載好放進
-# tools/，程式會自己去那裡找。要檢查現在缺什麼：python setup.py --check
+# 這兩個不用自己弄，也不用改 PATH —— 下載好的 zip 拖進程式視窗，或跑
+# python setup.py，都會放進 %LOCALAPPDATA%ili_trim_gui	ools，程式會自己去那裡找。要檢查現在缺什麼：python setup.py --check

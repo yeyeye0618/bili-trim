@@ -27,7 +27,8 @@ bili_font.py    準備介面字型：固定 Noto 的字重、把缺的字合併�
 bili_look.py    介面的樣子：稿紙的顏色、字級、主題（換主題只改這裡）
 fonts/          介面數字用的 Barlow Semi Condensed（SIL OFL 1.1，見 fonts/OFL.txt）
 assets/         圖示、字標、GitHub 分享圖；都是 assets/make_icon.py 畫的
-bili_env.py     找 adb / ffmpeg（先看 tools/，再看 PATH）與環境自我檢查
+bili_env.py     找 adb / ffmpeg（先看 AppData 的 tools，再看 PATH）、從下載好的 zip 裝工具、環境自我檢查
+bili_drop.py    讓檔案總管裡的檔案可以拖進視窗（Windows）
 bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 ```
 
@@ -103,8 +104,9 @@ bili_config.py  設定檔（備份位置等），setup.py 會先幫你寫好
 2. **點兩下 `bili-trim.exe`**（圖示是一顆紅色的「b」印章）。
    第一次 Windows 可能跳「Windows 已保護您的電腦」：按**其他資訊 → 仍要執行**
    （exe 沒有數位簽章，不是中毒）
-3. 少了 `adb` 或 `ffmpeg` 的話，程式會自己跳出**環境檢查**視窗，
-   列出缺什麼、去哪裡下載、放到哪個資料夾，旁邊就是按鈕
+3. 少了 `adb` 或 `ffmpeg` 的話，程式會自己跳出**環境檢查**視窗：按「下載 adb」，
+   下載好的 zip **直接拖進視窗**（不用解壓縮）。程式會檢查 zip、挑出需要的檔案放好、
+   試跑一次，然後自己去找手機
 4. 手機接上電腦、開「USB 偵錯」，按左下角的**重新掃描手機**
 
 ### 從原始碼跑（有 Python、想改程式的人）
@@ -155,10 +157,18 @@ Android 11 以上可以用「**無線偵錯**」代替 USB，能做的事完全�
 
 | | 去哪裡拿 | 放哪裡 | 沒有的話 |
 | --- | --- | --- | --- |
-| **adb** | [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools) | `tools/` 裡放 `adb.exe` 和旁邊的 `AdbWinApi.dll`、`AdbWinUsbApi.dll` | 完全不能用 |
-| **ffmpeg** | [ffmpeg.org](https://ffmpeg.org/download.html) | `tools/` 裡放 `ffmpeg`、`ffplay`、`ffprobe` 三個執行檔 | 預覽不能用，剪輯還是可以 |
+| **adb** | [Android SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools) | `adb.exe` 和旁邊的 `AdbWinApi.dll`、`AdbWinUsbApi.dll` | 完全不能用 |
+| **ffmpeg** | [gyan.dev 的 release-essentials.zip](https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip)（[ffmpeg.org](https://ffmpeg.org/download.html) 列的 Windows 建置） | `ffmpeg`、`ffplay`、`ffprobe` 三個執行檔 | 預覽不能用，剪輯還是可以 |
 
-**不用改 PATH。** 程式先看專案裡的 `tools/`，再看 PATH ——
+**放法：把下載好的 zip 拖進程式視窗**（或環境檢查裡的「選擇檔案…」）。程式會核對
+zip 有沒有下載完整、只挑上面那幾個檔案放進 tools 資料夾、再試跑一次確定能用。
+已經解開的資料夾拖進來也可以。
+
+tools 資料夾是 **`%LOCALAPPDATA%\bili_trim_gui\tools`**，exe 和原始碼版共用這一份：
+在哪個版本裝的，另一個版本都找得到。以前放在專案裡 `tools/` 的，原始碼版開起來時
+會自己複製過去（原本的不會刪）。
+
+**不用改 PATH。** 程式先看 tools 資料夾，再看 PATH ——
 已經有 adb／ffmpeg 的人不受影響，沒有的人也不必去翻「系統環境變數」。
 那是這個專案以前最大的摩擦：下載、解壓、新增一列、重開終端機，
 任何一步漏掉，看到的都只是一句「找不到 adb」，而且看不出是哪一步錯。
@@ -177,7 +187,7 @@ python setup.py
 | 步驟 | 內容 |
 | --- | --- |
 | Python 套件 | 裝到「現在跑的這個」直譯器 |
-| 外部工具 | **問過你之後**才從官方來源下載，放進 `tools/` |
+| 外部工具 | **問過你之後**才從官方來源下載，放進 `%LOCALAPPDATA%\bili_trim_gui\tools` |
 | 字型 | 先把介面字型準備好（約一分鐘），省得第一次開程式時等 |
 | 啟動方式 | 把它用的那個 Python 記進 `python-path.txt`，啟動檔會優先讀它 |
 | 設定 | 問備份位置、建好資料夾、寫進設定檔 |
@@ -213,15 +223,16 @@ GitHub Actions（`.github/workflows/release-exe.yml`）會在 Windows 上做好 
 拿到 exe 的人：
 
 1. 把 `bili-trim.exe` 放到任何自己的資料夾（不要放 `Program Files`）
-2. adb 和 ffmpeg 一樣要自己準備：已經在 PATH 裡就不用管；沒有的話在 exe 旁邊
-   建一個 `tools` 資料夾，放法跟上面那張表一樣
-3. 點兩下 `bili-trim.exe`
+2. 點兩下 `bili-trim.exe`
+3. adb 和 ffmpeg 一樣要自己準備：已經在 PATH 裡就不用管；沒有的話把下載好的
+   zip 拖進視窗，會裝到 `%LOCALAPPDATA%\bili_trim_gui\tools`
 
 幾件要知道的事：
 
 - **adb 和 ffmpeg 不會封進 exe。** 理由跟 `--pack` 那段一樣（授權不同）。
-- **從手機拉下來的暫存放在 exe 旁邊**的 `bili_gui_stage`；設定和字型快取跟原始碼版
-  共用 `%APPDATA%\bili_trim_gui\`，兩個版本可以輪流用。
+- **exe 旁邊不會多出任何東西。** 工具和從手機拉下來的暫存放在
+  `%LOCALAPPDATA%\bili_trim_gui\`（`tools`、`stage`）；設定和字型快取在
+  `%APPDATA%\bili_trim_gui\`。工具、設定、字型都跟原始碼版共用，兩個版本可以輪流用。
 - **第一次開會比較慢**：exe 要先把自己解開（每次幾秒），在新電腦上還要準備介面字型
   （約一分鐘，在背景做）。
 - **Windows 可能會擋。** exe 沒有數位簽章，SmartScreen 會跳「Windows 已保護您的電腦」，
@@ -235,19 +246,18 @@ GitHub Actions（`.github/workflows/release-exe.yml`）會在 Windows 上做好 
 python setup.py --pack
 ```
 
-產生 `bili-trim-portable.zip`，**連 `tools/` 一起包進去**（加 `--no-tools`
-可以不包）。在新電腦解壓之後點兩下 `bili-trim.bat`，因為工具已經在裡面了，
-不用再下載一次。
+產生 `bili-trim-portable.zip`，**連 adb 和 ffmpeg 一起包進去**（放在包裡的 `tools/`；
+加 `--no-tools` 可以不包）。在新電腦解壓之後點兩下 `bili-trim.bat`，程式第一次開時
+會把它們裝進那台電腦的 `%LOCALAPPDATA%\bili_trim_gui\tools`，不用再下載一次。
 
 > 這個包是給自己搬家用的，不適合公開散佈 —— 裡面的 ffmpeg 多半是 GPL
 > 授權的建置，platform-tools 也有自己的條款，跟本專案的 MIT 不是同一回事。
 
 ### 出問題的時候
 
-程式裡：右上角**說明 → 環境檢查**。逐項列出 Python、三個套件、
-adb／ffmpeg／ffplay／ffprobe、介面字型、備份位置，缺的東西下面就是下載
-連結和「開啟 tools 資料夾」按鈕。按**把結果寫進訊息**會打開訊息視窗，
-那裡的**全部複製**可以整段貼出來。
+程式裡：右上角**說明 → 環境檢查**。視窗只講缺什麼、怎麼補；按
+**把詳細結果寫進訊息**會逐項列出 Python、三個套件、adb／ffmpeg／ffplay／ffprobe
+在哪裡、介面字型、備份位置，訊息視窗的**全部複製**可以整段貼出來。
 
 命令列：
 
@@ -395,7 +405,8 @@ payload/<type_tag>/audio.m4s
 
 ## 本機暫存
 
-`bili_gui_stage/<cid 目錄>/` 是**手機上那一份的鏡像**，旁邊的
+`bili_gui_stage/<cid 目錄>/`（exe 版是 `%LOCALAPPDATA%\bili_trim_gui\stage`）
+是**手機上那一份的鏡像**，旁邊的
 `.bili_gui_stage.json` 記著每個檔案的大小、md5，以及這支被剪過幾次。
 
 - 下次載入同一支會先驗這份暫存，驗得過就直接重用，不必再拉幾百 MB
