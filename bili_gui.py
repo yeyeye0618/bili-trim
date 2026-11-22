@@ -46,6 +46,8 @@ import bili_filedlg as FD
 import bili_font as BF
 import bili_look as LOOK
 import bili_media as MED
+import bili_mdns as MDNS
+import bili_qr as QR
 import bili_trim as TRIM
 
 for _s in (sys.stdout, sys.stderr):
@@ -320,7 +322,9 @@ class App(object):
         self.TL_CELLS = px(50)
         self.TL_BAND = px(26)
         self.TL_FOOT = px(22)
-        self.TL_H = self.TL_RULER + self.TL_CELLS + self.TL_BAND + self.TL_FOOT
+        self.TL_SCROLL = px(14)   # 最下面的捲軸：放大之後才有把手，拖它左右移動
+        self.TL_H = (self.TL_RULER + self.TL_CELLS + self.TL_BAND + self.TL_FOOT
+                     + self.TL_SCROLL)
         self.EDGE_GRAB = px(7)    # 抓刪除號兩端的像素容忍度
         self.ROW_H_HEAD = px(30)
         self.ROW_H = px(36)
@@ -383,6 +387,11 @@ class App(object):
         self.duration = 0.0
         self.bounds = []
         self.cuts = []             # [[a, b], ...] 使用者要求的（還沒吸附）
+        # 載入過的影片：換去看別支時把狀態（解析好的 fragment、標好的區間、播放位置、
+        # 縮放）收起來，回來直接接著用，不用再核對暫存、不會弄丟標好的區間。
+        # 只放在記憶體裡，關掉程式就沒了。key 是手機上的路徑。
+        self._sessions = {}
+        self._loaded_key = None
         self.mark_in = None
         self.mark_out = None
 
@@ -679,6 +688,11 @@ class App(object):
     def seg(self, key, labels, value, callback, width=0, height=0):
         """兩段式切換鈕（原片／成品、外擴／內縮）。選中的是墨底白字。"""
         tags = []
+        if not width:
+            # 選中的那顆是粗體、比較寬；寬度不固定的話一切換整列寬度就變，
+            # 播放列會在「一列放得下／放不下」之間跳來跳去（看起來像奇怪的換行）
+            width = int(max(max(self.measure(l, "strong"), self.measure(l, "body"))
+                            for l in labels) + 2 * px(14))
         with dpg.group(horizontal=True, horizontal_spacing=0):
             for i, lab in enumerate(labels):
                 tag = "seg_%s_%d" % (key, i)
@@ -832,12 +846,17 @@ class App(object):
                 dpg.add_menu_item(label="中斷這支的 Wi-Fi 連線",
                                   parent="pop_dev_list",
                                   callback=self.disconnect_wifi)
+                dpg.add_menu_item(label="清除這支的配對",
+                                  parent="pop_dev_list",
+                                  callback=self.forget_wifi_device)
 
     def _build_popups(self):
         """頂列的四個選單。點一下就開，不是右鍵。"""
         left = dpg.mvMouseButton_Left
+        # max_size 一定要給：清單放在 group 裡，選單項目會撐滿可用寬度、group 又
+        # 跟著內容變寬，兩個互相推，選單每一格畫面都變寬一點，直到碰到螢幕邊（實測）
         with dpg.popup("chip_dev", mousebutton=left, tag="pop_dev",
-                       min_size=(px(280), px(20))):
+                       min_size=(px(280), px(20)), max_size=(px(460), px(900))):
             dpg.add_group(tag="pop_dev_list")
             dpg.add_separator()
             dpg.add_menu_item(label="重新掃描裝置與快取",
@@ -1162,72 +1181,102 @@ class App(object):
     def _build_wifi_window(self):
         W = px(780)
 
-        def section(title, note):
-            dpg.add_spacer(height=px(4))
+        def section(title, note=None):
+            dpg.add_spacer(height=px(6))
             self.font(dpg.add_text(title), "strong")
-            self.font(dpg.add_text(note, wrap=W, color=LOOK.INK_2), "small")
+            if note:
+                self.font(dpg.add_text(note, wrap=W, color=LOOK.INK_2), "small")
 
         self.font(dpg.add_text(
-            "不用接線，改走 Wi-Fi：手機要 Android 11 以上，跟電腦在同一個區網（電腦用"
-            "網路線也行）。手機上：開發人員選項 →「無線偵錯」打開。找手機和傳檔的時候，"
-            "手機螢幕要亮著。", wrap=W), "body")
+            "不用接線，改走 Wi-Fi。手機要 Android 11 以上、跟電腦連同一個網路（電腦用"
+            "網路線也行），手機上打開：開發人員選項 →「無線偵錯」。手機螢幕要亮著。",
+            wrap=W), "body")
 
-        section("找手機",
-                "程式會找用 Wi-Fi 連過的手機，和在網路上廣播的手機，並自己試出它現在的"
-                "埠號（約 3 秒）。找到的列在下面，選一支按「連線」。")
+        # ---- 區網上的手機（視窗開著就一直在找） ----
+        dpg.add_spacer(height=px(6))
         with dpg.group(horizontal=True):
-            b = dpg.add_button(label="找手機", tag="btn_wifi_scan", width=px(110),
-                               callback=self.wifi_search)
-            self.theme(b, "ink")
-            self.font(b, "strong")
+            self.font(dpg.add_text("區網上的手機"), "strong")
             with dpg.group() as g:
                 self.theme(g, "tight")
-                dpg.add_spacer(height=px(11))
-                p_ = dpg.add_progress_bar(tag="wifi_prog", width=px(240),
+                dpg.add_spacer(height=px(2))
+                self.font(dpg.add_text("", tag="wifi_live", color=LOOK.INK_2), "small")
+            with dpg.group() as g:
+                self.theme(g, "tight")
+                dpg.add_spacer(height=px(8))
+                p_ = dpg.add_progress_bar(tag="wifi_prog", width=px(200),
                                           height=px(10), show=False)
                 self.theme(p_, "progress")
-        dpg.add_group(tag="wifi_results")
+        dpg.add_group(tag="wifi_phones")
         self.font(dpg.add_text("", tag="wifi_status", wrap=W,
                                color=LOOK.INK_2), "small")
 
-        section("只知道手機的 IP",
-                "填「無線偵錯」畫面上的 IP（冒號前面那段），程式會幫你試出埠號。")
+        # ---- 第一次：掃 QR 配對 ----
+        section("第一次用：配對")
         with dpg.group(horizontal=True):
-            t = dpg.add_input_text(tag="wifi_ip", width=px(270), hint="192.168.1.23",
-                                   on_enter=True, callback=self.wifi_find_ip)
-            self.font(t, "num")
-            dpg.add_button(label="找埠號", tag="btn_wifi_ip", width=px(110),
-                           callback=self.wifi_find_ip)
+            side = self.QR_MODULES * self._qr_cell()
+            dpg.add_drawlist(width=side, height=side, tag="wifi_qr")
+            with dpg.group():
+                tw = W - side - px(24)
+                self.font(dpg.add_text(
+                    "手機上：「無線偵錯」→「使用 QR 圖碼配對裝置」，掃左邊這張。"
+                    "掃完電腦會自己配對、連上，什麼都不用打。配對只要做一次，"
+                    "之後打開這個視窗，手機會出現在上面的清單。", wrap=tw), "body")
+                dpg.add_spacer(height=px(6))
+                self.font(dpg.add_text("", tag="wifi_qr_state", wrap=tw,
+                                       color=LOOK.INK_2), "small")
+                dpg.add_spacer(height=px(6))
+                dpg.add_button(label="換一張", width=px(110), callback=self._qr_new)
+                dpg.add_spacer(height=px(6))
+                self.font(dpg.add_text(
+                    "手機沒有 QR 選項的話：點「使用配對碼配對裝置」，手機會出現在"
+                    "上面的清單裡，填 6 位數配對碼就好。", wrap=tw, color=LOOK.INK_2),
+                    "small")
 
-        section("第一次：配對",
-                "在手機上點「使用配對碼配對裝置」，把跳出來的視窗裡的「IP 位址和通訊埠」"
-                "和 6 位數配對碼填在這裡。配對只要做一次。")
-        with dpg.group(horizontal=True):
-            t = dpg.add_input_text(tag="wifi_pair_addr", width=px(270),
-                                   hint="192.168.1.23:37165")
-            self.font(t, "num")
-            t = dpg.add_input_text(tag="wifi_code", width=px(150),
-                                   hint="6 位數配對碼", decimal=True,
-                                   on_enter=True, callback=self.wifi_pair)
-            self.font(t, "body")          # 提示字是中文，數字字型畫不出來
-            dpg.add_button(label="配對", tag="btn_wifi_pair", width=px(110),
-                           callback=self.wifi_pair)
+        # ---- 都不行才用：手動 ----
+        dpg.add_spacer(height=px(6))
+        with dpg.collapsing_header(label="清單裡一直沒有手機？手動輸入", default_open=False):
+            self.font(dpg.add_text(
+                "有些網路（學校、公司）會擋手機的廣播，清單就會是空的。改用手機"
+                "「無線偵錯」畫面上寫的 IP 位址。", wrap=W, color=LOOK.INK_2), "small")
+            section("只知道手機的 IP",
+                    "填「無線偵錯」畫面上的 IP（冒號前面那段），程式會幫你試出埠號（約 3 秒）。")
+            with dpg.group(horizontal=True):
+                t = dpg.add_input_text(tag="wifi_ip", width=px(270), hint="192.168.1.23",
+                                       on_enter=True, callback=self.wifi_find_ip)
+                self.font(t, "num")
+                dpg.add_button(label="找埠號", tag="btn_wifi_ip", width=px(110),
+                               callback=self.wifi_find_ip)
+            dpg.add_group(tag="wifi_results")
 
-        section("手動連線",
-                "直接填「無線偵錯」畫面上的「IP 位址和通訊埠」（跟配對用的埠號不一樣）。")
-        with dpg.group(horizontal=True):
-            t = dpg.add_input_text(tag="wifi_conn_addr", width=px(270),
-                                   hint="192.168.1.23:41235", on_enter=True,
-                                   callback=self.wifi_connect)
-            self.font(t, "num")
-            dpg.add_button(label="連線", tag="btn_wifi_conn", width=px(110),
-                           callback=self.wifi_connect)
+            section("用配對碼配對",
+                    "手機上點「使用配對碼配對裝置」，把跳出來的視窗裡的「IP 位址和通訊埠」"
+                    "和 6 位數配對碼填在這裡。")
+            with dpg.group(horizontal=True):
+                t = dpg.add_input_text(tag="wifi_pair_addr", width=px(270),
+                                       hint="192.168.1.23:37165")
+                self.font(t, "num")
+                t = dpg.add_input_text(tag="wifi_code", width=px(150),
+                                       hint="6 位數配對碼", decimal=True,
+                                       on_enter=True, callback=self.wifi_pair)
+                self.font(t, "body")          # 提示字是中文，數字字型畫不出來
+                dpg.add_button(label="配對", tag="btn_wifi_pair", width=px(110),
+                               callback=self.wifi_pair)
+
+            section("手動連線",
+                    "已經配對過：填「無線偵錯」主畫面上的「IP 位址和通訊埠」"
+                    "（跟配對用的埠號不一樣）。")
+            with dpg.group(horizontal=True):
+                t = dpg.add_input_text(tag="wifi_conn_addr", width=px(270),
+                                       hint="192.168.1.23:41235", on_enter=True,
+                                       callback=self.wifi_connect)
+                self.font(t, "num")
+                dpg.add_button(label="連線", tag="btn_wifi_conn", width=px(110),
+                               callback=self.wifi_connect)
 
         dpg.add_spacer(height=px(4))
         dpg.add_separator()
         with dpg.group(horizontal=True):
-            dpg.add_button(label="關閉", width=px(96),
-                           callback=lambda: dpg.hide_item("win_wifi"))
+            dpg.add_button(label="關閉", width=px(96), callback=self.hide_wifi_window)
             with dpg.group() as g:
                 self.theme(g, "tight")
                 dpg.add_spacer(height=px(7))
@@ -1238,26 +1287,33 @@ class App(object):
     def show_wifi_window(self):
         self.center_window("win_wifi")
         dpg.show_item("win_wifi")
-        self.wifi_search()
+        self._wifi_status("")
+        qr = getattr(self, "_qr", None)
+        if not qr or qr["done"]:
+            self._qr_new()
+        self._wifi_phones_sig = None
+        if not getattr(self, "_wifi_watch", False):
+            self._wifi_watch = True
+            threading.Thread(target=self._wifi_watcher, name="wifi-watch",
+                             daemon=True).start()
+
+    def hide_wifi_window(self, *_):
+        self._wifi_watch = False
+        dpg.hide_item("win_wifi")
 
     def _wifi_status(self, text, kind="info"):
         if not dpg.does_item_exist("wifi_status"):
             return
         color = {"ok": LOOK.OK, "bad": LOOK.INK}.get(kind, LOOK.INK_2)
         dpg.set_value("wifi_status", text)
-        dpg.configure_item("wifi_status", color=color)
+        dpg.configure_item("wifi_status", color=color, show=bool(text))
         self.font("wifi_status", "strong_s" if kind == "bad" else "small")
 
     def _wifi_job(self, busy_text, fn):
         """在背景跑一個 adb 動作，按鈕先停用，結果寫回視窗裡那一行。"""
-        if getattr(self, "_wifi_busy", False):
+        if getattr(self, "_wifi_busy", False) or getattr(self, "_qr_busy", False):
             return
         self._wifi_busy = True
-        tags = ("btn_wifi_pair", "btn_wifi_conn", "btn_wifi_scan",
-                "btn_wifi_ip")
-        for t in tags:
-            if dpg.does_item_exist(t):
-                dpg.configure_item(t, enabled=False)
         self._wifi_status(busy_text)
 
         def body():
@@ -1272,9 +1328,6 @@ class App(object):
                 self._wifi_busy = False
                 if dpg.does_item_exist("wifi_prog"):
                     dpg.configure_item("wifi_prog", show=False)
-                for t in tags:
-                    if dpg.does_item_exist(t):
-                        dpg.configure_item(t, enabled=True)
                 text, kind, after = result
                 self._wifi_status(text, kind)
                 if kind == "bad":
@@ -1288,11 +1341,428 @@ class App(object):
         if value and dpg.does_item_exist(tag) and not (dpg.get_value(tag) or "").strip():
             dpg.set_value(tag, value)
 
-    # ---- 找手機 ----
+    # ---- 區網上的手機：視窗開著的時候，背景一直用 mDNS 找 ----
 
     NOT_LISTENING = ("手機在網路上，但無線偵錯沒有在聽。螢幕鎖過的話，有些手機（例如 vivo）"
                      "會悄悄停掉無線偵錯，畫面上卻還寫著開著、還顯示舊的埠號 —— "
-                     "在手機上把無線偵錯關掉再打開，再按一次「找手機」。")
+                     "在手機上把無線偵錯關掉再打開。")
+
+    def _wifi_watcher(self):
+        """
+        （背景執行緒）視窗開著就每 1 秒多問一次區網，整理成手機清單交給主執行緒畫。
+        也負責 QR 配對：看到手機用 QR 裡的名稱廣播配對服務，就自己去配對。
+        視窗關掉（_wifi_watch 變 False）就停。
+        """
+        t0, probed, extra = time.time(), False, []
+        try:
+            browser = MDNS.Browser()
+        except OSError as e:
+            self.post(lambda: self._wifi_status("沒辦法在網路上找手機：%s" % e, "bad"))
+            self._wifi_watch = False
+            return
+        try:
+            while self._wifi_watch:
+                browser.poll(1.0)
+                svcs = browser.services(max_age=6)
+                try:
+                    devs = [d for d in DEV.list_devices() if d.wireless]
+                except DEV.AdbError:
+                    devs = []
+                qr = self._qr or {"name": "", "done": True}
+                mine = [s for s in svcs if s.kind == "pairing" and s.instance == qr["name"]]
+                if mine and not self._wifi_busy and not qr["done"]:
+                    self._qr_pair(mine[0], svcs)
+                    continue
+                # 用 Wi-Fi 連過、但沒在廣播的手機（有些網路擋廣播）：自己試埠號，只試一次
+                if not probed and time.time() - t0 > 3:
+                    probed = True
+                    seen = set(s.ip for s in svcs) | set(DEV.host_of(d.serial) for d in devs)
+                    for h in self.cfg.get("wifi_hosts") or []:
+                        if h not in seen and self._wifi_watch:
+                            extra.append(self._probe_host(h, "用 Wi-Fi 連過"))
+                    self.post(lambda: dpg.does_item_exist("wifi_prog")
+                              and dpg.configure_item("wifi_prog", show=False))
+                phones = self._wifi_phones(svcs, devs, extra, qr["name"])
+                self.post(lambda p=phones, n=time.time() - t0:
+                          self._wifi_render(p, n))
+        finally:
+            browser.close()
+
+    def _wifi_phones(self, svcs, devs, extra, qr_name):
+        """（背景執行緒）把服務、adb 連著的、自己試出來的併成一支手機一筆。"""
+        paired = DEV.paired_guids()
+        names = self.cfg.get("wifi_names") or {}
+        models = self.cfg.get("wifi_models") or {}
+        guid_by_ip = self.cfg.get("wifi_guids") or {}
+        phones = {}
+
+        def phone(key, ip):
+            p = phones.get(key)
+            if p is None:
+                # 自己試埠號找到的只知道 IP；靠之前看過的 IP -> guid 對回是哪支，
+                # 不然同一支手機會在清單裡出現兩次（另一筆是「配對過，不在網路上」）
+                guid = key if key.startswith("adb-") else guid_by_ip.get(ip, "")
+                p = phones[key] = {"key": key, "ip": ip, "guid": guid,
+                                   "model": names.get(ip, "") or models.get(guid, ""),
+                                   "connect": "", "pair": "", "serial": "",
+                                   "paired": False, "away": False, "note": ""}
+            return p
+        for s in svcs:
+            if s.instance == qr_name:
+                continue                    # 掃 QR 的那個由 QR 那邊處理
+            key = s.instance if s.instance.startswith("adb-") else s.ip
+            p = phone(key, s.ip)
+            p["ip"] = p["ip"] or s.ip
+            if s.kind == "connect":
+                p["connect"] = s.addr
+                p["model"] = s.txt.get("name") or p["model"]
+            else:
+                p["pair"] = s.addr
+            if key in paired:
+                p["paired"] = True
+        for d in devs:
+            guid = d.serial.split("._adb-tls-", 1)[0]
+            host = DEV.host_of(d.serial) if DEV._ADDR.match(d.serial) else ""
+            hit = phones.get(guid) or next(
+                (p for p in phones.values() if host and p["ip"] == host), None)
+            if hit is None:
+                hit = phone(guid if not host else host, host)
+            hit["serial"], hit["paired"] = d.serial, True
+            hit["model"] = d.model or hit["model"]
+            hit["guid"] = hit["guid"] or DEV.guid_of(d.serial)
+        for row in extra:
+            if any(p["ip"] == row["host"] for p in phones.values()):
+                continue
+            p = phone(row["host"], row["host"])
+            p["connect"] = row["addrs"][0] if row["addrs"] else ""
+            p["paired"] = True              # 連過才會在 wifi_hosts 裡
+            p["note"] = "" if row["addrs"] else self.NOT_LISTENING
+        # 配對過、但現在不在網路上的：也列出來，才清得掉它的配對
+        seen = set(p["guid"] for p in phones.values())
+        for g in sorted(paired - seen):
+            p = phone(g, "")
+            p["paired"], p["away"] = True, True
+        return sorted(phones.values(), key=lambda p: (not p["serial"], p["away"], p["ip"]))
+
+    def _wifi_render(self, phones, elapsed):
+        if not dpg.does_item_exist("wifi_phones"):
+            return
+        if not dpg.is_item_shown("win_wifi"):
+            self._wifi_watch = False          # 視窗被標題列的 X 關掉
+            return
+        dpg.set_value("wifi_live", "　持續在找…" if elapsed < 15 or not phones
+                      else "　每秒更新")
+        sig = tuple((p["key"], p["ip"], p["model"], p["connect"], p["pair"], p["serial"],
+                     p["paired"], p["away"], p["note"]) for p in phones)
+        if sig == getattr(self, "_wifi_phones_sig", None):
+            return
+        self._wifi_phones_sig = sig
+        # 記住每支配對過的手機叫什麼、在哪個 IP：它不在網路上的時候清單才寫得出
+        # 名字，自己試埠號找到它的時候才對得回是哪支
+        models = dict(self.cfg.get("wifi_models") or {})
+        ips = dict(self.cfg.get("wifi_guids") or {})
+        for p in phones:
+            if p["guid"] and p["model"]:
+                models[p["guid"]] = p["model"]
+            if p["guid"] and p["ip"]:
+                ips[p["ip"]] = p["guid"]
+        if models != (self.cfg.get("wifi_models") or {}) or \
+                ips != (self.cfg.get("wifi_guids") or {}):
+            self.cfg["wifi_models"], self.cfg["wifi_guids"] = models, ips
+            save_config(self.cfg)
+        # 重畫之前先把使用者打到一半的配對碼存起來
+        typed = {}
+        for p in phones:
+            tag = "wifi_code_" + p["key"]
+            if dpg.does_item_exist(tag):
+                typed[tag] = dpg.get_value(tag)
+        dpg.delete_item("wifi_phones", children_only=True)
+        self._wifi_code_inputs = []
+        W = px(780)
+        if not phones:
+            self.font(dpg.add_text(
+                "還沒看到手機。確認手機和電腦連同一個 Wi-Fi、手機上「無線偵錯」開著、"
+                "手機螢幕亮著。從來沒配對過的話，先掃下面的 QR 圖碼。",
+                wrap=W, color=LOOK.INK_2, parent="wifi_phones"), "small")
+            return
+        for p in phones:
+            title = p["model"] or (p["guid"][4:].rsplit("-", 1)[0] if p["guid"]
+                                   else "Android 手機")
+            where = p["ip"] or ("" if p["away"] else "Wi-Fi")
+            with dpg.group(horizontal=True, parent="wifi_phones"):
+                if p["serial"]:
+                    b = dpg.add_button(label="用這支", width=px(110),
+                                       user_data=(p["serial"], p["ip"]),
+                                       callback=self._wifi_use)
+                    self.theme(b, "ink")
+                    state = "已經連上"
+                elif p["pair"]:
+                    tag = "wifi_code_" + p["key"]
+                    t = dpg.add_input_text(tag=tag, width=px(150), hint="6 位數配對碼",
+                                           decimal=True, on_enter=True,
+                                           default_value=typed.get(tag, ""),
+                                           user_data=(p["pair"], tag),
+                                           callback=self._wifi_pair_row)
+                    self.font(t, "body")
+                    self._wifi_code_inputs.append(tag)
+                    b = dpg.add_button(label="配對", width=px(90),
+                                       user_data=(p["pair"], tag),
+                                       callback=self._wifi_pair_row)
+                    self.theme(b, "ink")
+                    state = "配對視窗開著：填手機上的 6 位數配對碼"
+                elif p["connect"] and p["paired"]:
+                    b = dpg.add_button(label="連線", width=px(110), user_data=p["connect"],
+                                       callback=self._wifi_connect_to)
+                    self.theme(b, "ink")
+                    state = "配對過了"
+                elif p["connect"]:
+                    state = "還沒跟這台電腦配對 —— 掃下面的 QR 圖碼"
+                elif p["away"]:
+                    state = "配對過，現在不在網路上"
+                else:
+                    state = "連不上"
+                with dpg.group() as g:
+                    self.theme(g, "tight")
+                    dpg.add_spacer(height=px(6))
+                    with dpg.group(horizontal=True):
+                        # tight 主題把項目間距拿掉了，間隔用字自己留
+                        self.font(dpg.add_text(title), "strong")
+                        if where:
+                            self.font(dpg.add_text("  " + where, color=LOOK.INK_2), "num")
+                        self.font(dpg.add_text(
+                            "　" + state, color=LOOK.OK if p["serial"] else LOOK.INK_2),
+                            "body")
+                if p["paired"]:
+                    dpg.add_spacer(width=px(12))
+                    dpg.add_button(label="清除配對", width=px(100),
+                                   user_data=(p["guid"], p["ip"], title),
+                                   callback=self._wifi_forget)
+            if p["note"]:
+                self.font(dpg.add_text(p["note"], wrap=W, color=LOOK.INK_2,
+                                       parent="wifi_phones"), "small")
+
+    def _wifi_use(self, sender, app_data, user_data):
+        serial, host = user_data
+
+        def work():
+            return self._wifi_connected(serial, host)
+        self._wifi_job("切換中…", work)
+
+    # ---- 清除配對 ----
+
+    def _forget_phone(self, guid, host):
+        """
+        （背景執行緒）電腦這邊忘掉一支手機：從 adb 的配對清單拿掉（adb 就不會再自動
+        連它）、中斷它的 Wi-Fi 連線、程式記的 IP 也清掉（重新掃描不會再去試它）。
+        手機那邊還認得這台電腦，只能在手機上清（見 DEV.forget_paired 上面的說明）。
+        回傳清完之後還連著的裝置。
+        """
+        if guid:
+            DEV.forget_paired(guid)
+        for d in DEV.list_devices():
+            if not d.wireless:
+                continue
+            if (guid and d.serial.startswith(guid + ".")) or \
+                    (host and DEV.host_of(d.serial) == host) or \
+                    (guid and DEV.guid_of(d.serial) == guid):
+                DEV.disconnect(d.serial)
+        self.cfg["wifi_hosts"] = [h for h in (self.cfg.get("wifi_hosts") or [])
+                                  if h != host]
+        if host and DEV.host_of(self.cfg.get("wifi_last") or "") == host:
+            self.cfg["wifi_last"] = ""
+        models = dict(self.cfg.get("wifi_models") or {})
+        models.pop(guid, None)
+        self.cfg["wifi_models"] = models
+        self.cfg["wifi_guids"] = {ip: g for ip, g in (self.cfg.get("wifi_guids") or {}).items()
+                                  if g != guid and ip != host}
+        save_config(self.cfg)
+        return DEV.list_devices()
+
+    def _forget_text(self, name):
+        pc = DEV.pc_name() or "這台電腦"
+        return ("電腦這邊的配對清掉了，不會再自動連 %s。手機那邊也要清的話：手機上"
+                "「無線偵錯」→「已配對的裝置」→「%s」→「忘記」。之後要再用，掃 QR 重新配對。"
+                % (name, pc))
+
+    def _wifi_forget(self, sender, app_data, user_data):
+        guid, host, name = user_data
+
+        def work():
+            devs = self._forget_phone(guid, host)
+            self.log("Wi-Fi：清除 %s 的配對" % name)
+
+            def after():
+                self._wifi_phones_sig = None      # 清單下一輪整個重畫
+                self._after_wifi_drop(devs)
+            return self._forget_text(name), "ok", after
+        self._wifi_job("清除配對…", work)
+
+    def forget_wifi_device(self, *_):
+        """裝置選單：清除現在這支（用 Wi-Fi 連著的）手機的配對。"""
+        dev = self.device
+        if dev is None or not dev.wireless:
+            return
+        host = DEV.host_of(dev.serial) if DEV._ADDR.match(dev.serial) else ""
+        name = dev.model or dev.label
+
+        def work():
+            devs = self._forget_phone(DEV.guid_of(dev.serial), host)
+            self.log("Wi-Fi：" + self._forget_text(name))
+            return devs
+
+        def done(devs):
+            self._after_wifi_drop(devs)
+            self.show_log()
+        self.run_worker("清除配對", work, done)
+
+    def _after_wifi_drop(self, devs):
+        """Wi-Fi 連線斷掉之後：現在用的那支不見了就清空畫面，還有別支就換過去。"""
+        self.devices = devs
+        if self.device is not None:
+            same = [d for d in devs if d.serial == self.device.serial]
+            if same:                      # Device 沒有 __eq__，要比序號
+                self.device = same[0]
+                self._sync_device_ui()
+                return
+        if self.item is not None:
+            self.select_item(None)
+        self.device = None
+        self.items, self.roots = [], []
+        self._sync_device_ui()
+        self.rebuild_library()
+        if devs:                          # 還有別支（例如 USB 接著的）就換過去
+            self.refresh_all()
+
+    def _wifi_pair_row(self, sender, app_data, user_data):
+        addr, tag = user_data
+        self._wifi_pair_with(addr, dpg.get_value(tag) if dpg.does_item_exist(tag) else "")
+
+    # ---- QR 圖碼配對 ----
+
+    QR_MODULES = 37                         # 版本 3（29 格）+ 四周各留 4 格白
+
+    def _qr_cell(self):
+        return max(3, int(round(px(6))))
+
+    def _qr_new(self, *_):
+        """換一組名稱和密碼，重畫 QR。用過（配對成功或失敗）就換，舊的不能再用。"""
+        import random
+        rnd = random.SystemRandom()
+        abc = "abcdefghijkmnpqrstuvwxyz23456789"
+        self._qr = {"name": "bili-trim-" + "".join(rnd.choice(abc) for _ in range(6)),
+                    "pw": "".join(rnd.choice("0123456789") for _ in range(6)),
+                    "tried": [], "done": False}
+        self._qr_state("等手機掃描…")
+        if not dpg.does_item_exist("wifi_qr"):
+            return
+        m = QR.matrix(QR.adb_pairing_text(self._qr["name"], self._qr["pw"]))
+        cell = self._qr_cell()
+        quiet = (self.QR_MODULES - len(m)) // 2
+        side = self.QR_MODULES * cell
+        dpg.delete_item("wifi_qr", children_only=True)
+        # 手機相機要黑白分明：底色用純白，不用稿紙色
+        dpg.draw_rectangle((0, 0), (side, side), fill=(255, 255, 255, 255),
+                           color=(255, 255, 255, 255), parent="wifi_qr")
+        for y, row in enumerate(m):
+            x = 0
+            while x < len(row):             # 同一列連著的黑格畫成一條，少畫很多個
+                if not row[x]:
+                    x += 1
+                    continue
+                x2 = x
+                while x2 < len(row) and row[x2]:
+                    x2 += 1
+                x0, y0 = (quiet + x) * cell, (quiet + y) * cell
+                dpg.draw_rectangle((x0, y0), ((quiet + x2) * cell, y0 + cell),
+                                   fill=LOOK.INK, color=LOOK.INK, thickness=0,
+                                   parent="wifi_qr")
+                x = x2
+
+    def _qr_state(self, text, kind="info"):
+        if dpg.does_item_exist("wifi_qr_state"):
+            dpg.set_value("wifi_qr_state", text)
+            dpg.configure_item("wifi_qr_state",
+                               color={"ok": LOOK.OK, "bad": LOOK.INK}.get(kind, LOOK.INK_2))
+            self.font("wifi_qr_state", "strong_s" if kind != "info" else "small")
+
+    def _qr_pair(self, sv, svcs):
+        """
+        （背景執行緒，wifi_watcher 裡）手機掃了 QR、正在用 QR 裡的名稱廣播配對服務。
+        密碼要不要加引號看服務名稱（見 DEV.pair_qr）；不對的話手機會換個埠重新
+        廣播，下一輪用另一種再試一次。
+        """
+        qr = self._qr
+        if any(port == sv.port for port, _ in qr["tried"]):
+            return                          # 這個埠試過了，等手機換埠
+        if len(qr["tried"]) >= 2:
+            return
+        quoted = sv.name.startswith('"')
+        if qr["tried"]:
+            quoted = not qr["tried"][-1][1]
+        qr["tried"].append((sv.port, quoted))
+        model = next((s.txt.get("name") for s in svcs
+                      if s.kind == "connect" and s.ip == sv.ip and s.txt.get("name")), "")
+        who = model or sv.ip
+        self._qr_busy = True
+        self.post(lambda: self._qr_state("看到 %s 了，配對中…" % who))
+        try:
+            ok, why = DEV.pair_qr(sv.addr, qr["pw"], quoted)
+            if not ok:
+                if why == "code" and len(qr["tried"]) < 2:
+                    self.post(lambda: self._qr_state("配對中…（換一種方式再試）"))
+                    return
+                text = {"code": "配對失敗：手機不接受這組密碼。按「換一張」，手機上重新掃一次。",
+                        "reach": "配對失敗：連不到手機。確認手機和電腦連同一個 Wi-Fi，"
+                                 "按「換一張」重新掃一次。"}.get(why, "配對失敗：%s" % why)
+                qr["done"] = True
+                self.log("Wi-Fi：QR %s" % text)
+                self.post(lambda: self._qr_state(text, "bad"))
+                return
+            qr["done"] = True
+            self.log("Wi-Fi：用 QR 跟 %s 配對好了" % who)
+            self.post(lambda: self._qr_state("配對好了，連線中…", "ok"))
+            serial = self._wait_wireless(sv.ip)
+            if serial is None:
+                self.post(lambda: self._qr_state(
+                    "配對好了，但還連不上。手機會出現在上面的清單，按「連線」。", "ok"))
+                return
+            text, kind, after = self._wifi_connected(serial, sv.ip)
+
+            def finish():
+                self._qr = None             # 下次打開視窗再畫新的
+                after()
+            self.post(finish)
+        except (DEV.AdbError, ValueError) as e:
+            qr["done"] = True
+            self.post(lambda e=e: self._qr_state(str(e), "bad"))
+        finally:
+            self._qr_busy = False
+
+    def _wait_wireless(self, host, tries=10):
+        """
+        （背景執行緒）剛配對好：等 adb 自己連上（它看到廣播就會連），等不到就自己
+        照廣播的「連線」位址連。回傳序號，連不上回 None。
+        """
+        for i in range(tries):
+            for d in DEV.list_devices():
+                if d.wireless and (DEV.host_of(d.serial) == host
+                                   or not DEV._ADDR.match(d.serial)):
+                    return d.serial
+            if i < 3:
+                # 先給 adb 幾秒自己連。太早自己 connect 的話，adb 隨後又用 mDNS 連一次，
+                # 同一支手機會變成兩條連線，選單裡出現兩支（實測）
+                time.sleep(1.0)
+                continue
+            for _, a in DEV.discover(timeout=2)["connect"]:
+                if DEV.host_of(a) == host:
+                    try:
+                        return DEV.connect(a, timeout=10)
+                    except (DEV.AdbError, ValueError):
+                        pass
+            time.sleep(1.0)
+        return None
+
+    # ---- 手動：自己試埠號、配對碼、IP:埠號 ----
 
     def _wifi_prog(self, done, total, host):
         if dpg.does_item_exist("wifi_prog"):
@@ -1309,6 +1779,7 @@ class App(object):
         ports = DEV.find_adb_ports(
             host, progress=lambda d, n: self.post(
                 lambda d=d, n=n: self._wifi_prog(d, n, host)))
+        self.post(lambda: self._wifi_status(""))
         row["addrs"] = ["%s:%d" % (host, p) for p, _ in ports]
         if not row["addrs"]:
             row["note"] = self.NOT_LISTENING
@@ -1319,7 +1790,7 @@ class App(object):
             return
         dpg.delete_item("wifi_results", children_only=True)
         names = self.cfg.get("wifi_names") or {}
-        W = px(780)
+        W = px(760)
         for row in rows:
             model = names.get(row["host"], "")
             title = "%s（%s）" % (model, row["host"]) if model else row["host"]
@@ -1333,44 +1804,11 @@ class App(object):
                         self.theme(g, "tight")
                         dpg.add_spacer(height=px(6))
                         self.font(dpg.add_text(
-                            "%s　埠號 %s　· %s" % (title, addr.rsplit(":", 1)[1], row["source"])
-                            if addr else "%s　· %s" % (title, row["source"])), "body")
+                            "%s　埠號 %s" % (title, addr.rsplit(":", 1)[1])
+                            if addr else title), "body")
                 if not addr and row["note"]:
                     self.font(dpg.add_text(row["note"], wrap=W, color=LOOK.INK_2,
                                            parent="wifi_results"), "small")
-
-    def wifi_search(self, *_):
-        hosts = list(self.cfg.get("wifi_hosts") or [])
-
-        def work():
-            rows, seen = [], set()
-            found = DEV.discover(timeout=5)
-            pair = found["pair"][0][1] if found["pair"] else ""
-            for _, addr in found["connect"]:
-                h = DEV.host_of(addr)
-                if h not in seen:
-                    seen.add(h)
-                    rows.append({"host": h, "source": "網路上廣播的", "addrs": [addr],
-                                 "note": ""})
-            for h in hosts:
-                if h not in seen:
-                    seen.add(h)
-                    rows.append(self._probe_host(h, "用 Wi-Fi 連過"))
-
-            def show():
-                self._fill("wifi_pair_addr", pair)
-                self._show_wifi_results(rows)
-            if any(r["addrs"] for r in rows):
-                text, kind = "找到了，選一支按「連線」。", "ok"
-            elif rows:
-                text, kind = "沒找到開著無線偵錯的手機，看上面每一支的說明。", "info"
-            else:
-                text, kind = ("還沒用 Wi-Fi 連過手機，網路上也沒有手機在廣播。"
-                              "在下面填手機的 IP，程式會幫你試出埠號；第一次還要先配對。"), "info"
-            if pair:
-                text += "另外找到手機的配對視窗，配對位址已經填好。"
-            return text, kind, show
-        self._wifi_job("找手機…", work)
 
     def wifi_find_ip(self, *_):
         text = (dpg.get_value("wifi_ip") or "").strip().replace("：", ":")
@@ -1395,30 +1833,22 @@ class App(object):
         self._wifi_job("連線中…", work)
 
     def wifi_pair(self, *_):
-        addr = dpg.get_value("wifi_pair_addr")
-        code = dpg.get_value("wifi_code")
+        self._wifi_pair_with(dpg.get_value("wifi_pair_addr"), dpg.get_value("wifi_code"))
 
+    def _wifi_pair_with(self, addr, code):
         def work():
             DEV.pair(addr, code)
             host = DEV.host_of(DEV.parse_addr(addr))
-            # 配對完手機會改廣播「連線」那一組；adb 有時也會自己連上
-            for _ in range(8):
-                for d in DEV.list_devices():
-                    if d.wireless and (DEV.host_of(d.serial) == host
-                                       or not DEV._ADDR.match(d.serial)):
-                        return self._wifi_connected(d.serial, host)
-                conns = [a for _, a in DEV.discover(timeout=5)["connect"]
-                         if DEV.host_of(a) == host]
-                if conns:
-                    return self._wifi_connected(DEV.connect(conns[0]), host)
-                time.sleep(1.0)
+            serial = self._wait_wireless(host, tries=8)
+            if serial:
+                return self._wifi_connected(serial, host)
 
             def ask():
                 if dpg.does_item_exist("wifi_conn_addr") and \
                         not (dpg.get_value("wifi_conn_addr") or "").strip():
                     dpg.set_value("wifi_conn_addr", host + ":")
-            return ("配對好了。現在填「連線」那一格（無線偵錯主畫面上的 IP 位址和通訊埠），"
-                    "按「連線」。", "ok", ask)
+            return ("配對好了，但還連不上。手機會出現在上面的清單，按「連線」；"
+                    "或在「手動連線」填無線偵錯主畫面上的 IP 位址和通訊埠。", "ok", ask)
         self._wifi_job("配對中…", work)
 
     def wifi_connect(self, *_):
@@ -1440,7 +1870,7 @@ class App(object):
         self.log("Wi-Fi：連上 %s" % serial)
 
         def after():
-            dpg.hide_item("win_wifi")
+            self.hide_wifi_window()
             self._prefer_serial = serial
             self.refresh_all()
         return "連上了。", "ok", after
@@ -1512,14 +1942,8 @@ class App(object):
             return DEV.list_devices()
 
         def done(devs):
-            if self.item is not None:
-                self.select_item(None)
-            self.devices, self.device = devs, None
-            self.items, self.roots = [], []
-            self._sync_device_ui()
-            self.rebuild_library()
-            if devs:                      # 還有別支（例如 USB 接著的）就換過去
-                self.refresh_all()
+            self.device = None            # 剛中斷的就是現在這支
+            self._after_wifi_drop(devs)
         self.run_worker("中斷 Wi-Fi", work, done)
 
     def _sync_footer(self):
@@ -1815,8 +2239,6 @@ class App(object):
                  and self.mark_out is not None),
                 ("btn_mark_in", loaded),
                 ("btn_mark_out", loaded),
-                ("btn_clear_marks", loaded and (self.mark_in is not None
-                                                or self.mark_out is not None)),
                 ("seg_mode_0", loaded),
                 ("seg_mode_1", loaded),
                 ("chip_dev", not self.busy),
@@ -2093,7 +2515,7 @@ class App(object):
             hosts = list(self.cfg.get("wifi_hosts") or [])
             if hosts:
                 self._reconnect_wifi(hosts)
-            devs = DEV.list_devices()
+            devs = DEV.drop_duplicate_wifi(DEV.list_devices())
             if not devs:
                 state, ids = DEV.usb_diagnosis(DEV.device_states())
                 if state:
@@ -2391,10 +2813,12 @@ class App(object):
             ty += px(2)
             mx = x
             quality = it.quality_desc or ("q" + it.quality_dir)
-            for text, r, col in ((fmt_time(it.duration_s), "num_s", LOOK.INK_2),
-                                 (quality, "num_s" if quality.isascii()
-                                  else "strong_s", LOOK.INK),
-                                 (fmt_bytes(it.total_bytes), "num_s", LOOK.INK_2)):
+            meta = [(fmt_time(it.duration_s), "num_s", LOOK.INK_2),
+                    (quality, "num_s" if quality.isascii() else "strong_s", LOOK.INK),
+                    (fmt_bytes(it.total_bytes), "num_s", LOOK.INK_2)]
+            if it.device_path == self._loaded_key or it.device_path in self._sessions:
+                meta.append(("已載入", "strong_s", LOOK.OK))
+            for text, r, col in meta:
                 r = self.role_for(text, r)
                 self.font(dpg.add_text(text, parent="lib_list", pos=(mx, ty),
                                        color=col), r)
@@ -2424,12 +2848,52 @@ class App(object):
         self.post(self.rebuild_library)
 
     def select_item(self, item):
+        self._stash_session()
         self.item = item
         self.unload_video()
         self.show_selection()
         # 底列那則訊息講的是上一支，換了就不要再掛著
         if dpg.does_item_exist("last_msg"):
             dpg.set_value("last_msg", "")
+        if item is not None and item.device_path in self._sessions:
+            self._restore_session(item)
+
+    def _stash_session(self):
+        """現在載入的這支收起來（換去看別支之前）。"""
+        if self.vtrack is None or self._loaded_key is None:
+            return
+        self._sessions[self._loaded_key] = {
+            "local": self.local, "q_dir": self.q_dir, "vtrack": self.vtrack,
+            "native": self._native, "stage_note": self._stage_note,
+            "cuts": [list(c) for c in self.cuts],
+            "mark_in": self.mark_in, "mark_out": self.mark_out,
+            "playhead": self.playhead, "view": (self.view_a, self.view_b),
+        }
+        self._loaded_key = None
+
+    def _restore_session(self, item):
+        """
+        之前載入過這支：直接拿收起來的狀態，只重開預覽（ffmpeg 解碼器和聲音），
+        不核對暫存、不重新解析，標好的區間都還在。
+        """
+        st = self._sessions.get(item.device_path)
+        if st is None:
+            return False
+
+        def work():
+            src, native = self._open_preview(st["q_dir"])
+            return src, native or st["native"]
+
+        def done(res):
+            if self.item is not item:          # 等的時候使用者又換了一支（狀態還收著）
+                return
+            src, native = res
+            self._stage_note = st["stage_note"]
+            self._install_loaded(item, st["local"], st["q_dir"], st["vtrack"], src,
+                                 native, st)
+            self.log("接著剪：%s（%d 段已標好）" % (item.display_name[:40], len(self.cuts)))
+
+        return self.run_worker("載入", work, done)
 
     def show_selection(self):
         """重畫右邊「這一支」。重建介面時也要用，所以不能順手卸載影片。"""
@@ -2636,6 +3100,9 @@ class App(object):
         if item.unsupported_reason():
             self.log("這支不能處理：%s" % item.unsupported_reason())
             return
+        if not refresh and item.device_path in self._sessions:
+            self._restore_session(item)         # 載入過：接著剪，不用連手機
+            return
         if self.device is None:
             self.log("沒有連上裝置。")
             return
@@ -2653,47 +3120,65 @@ class App(object):
                         sum(vt.fragment_seconds()) / len(vt.frags),
                         fmt_time(vt.duration_s())))
             self.log(self.describe_version(local, vt))
-            src = None
-            native = (0, 0)
-            if MED.have_ffmpeg():
-                info = MED.probe(q / "video.m4s")
-                native = (int(info["width"] or 0), int(info["height"] or 0))
-                tw, th = self.texture_size_for(info["width"], info["height"])
-                self.log("畫面 %dx%d @ %.3g fps（%s），預覽用 %dx%d"
-                         % (info["width"], info["height"], info["fps"],
-                            info["codec"], tw, th))
-                src = MED.FrameSource(q / "video.m4s", tw, th)
+            src, native = self._open_preview(q, log=True)
             self.progress(1.0, "完成")
             return local, q, vt, src, native
 
         def done(res):
             local, q, vt, src, native = res
-            self._native = native
-            self.local, self.q_dir, self.vtrack = local, q, vt
-            self.duration = vt.duration_s()
-            self.bounds = vt.boundaries()
-            self.cuts = []
-            self.mark_in = self.mark_out = None
-            self.playhead = 0.0
-            self.src = src
-            if src is not None:
-                self.set_preview_texture(src.out_w, src.out_h)
-                self.scrub.set_source(src)
-                self.player = MED.Player(src, q / "audio.m4s")
-                self.player.volume = self.cfg["volume"]
-                self.player.audio_offset = self.cfg["audio_offset_ms"] / 1000.0
-                self.apply_segments()
-                self.scrub.request(0.0)
-            else:
-                self.player = None
-                self.clear_preview()
-            self._sync_footer()
-            self.zoom_all()
-            self.refresh_cuts_ui()
-            self.progress(0.0, "")
+            if self.item is not item:
+                return
+            self._install_loaded(item, local, q, vt, src, native, None)
             self.log("載入完成，可以開始挑廣告了。")
 
+        self._sessions.pop(item.device_path, None)
         self.run_worker("載入", work, done)
+
+    def _open_preview(self, q, log=False):
+        """（背景執行緒）開預覽用的解碼器。沒有 ffmpeg 就回 (None, (0, 0))。"""
+        if not MED.have_ffmpeg():
+            return None, (0, 0)
+        info = MED.probe(q / "video.m4s")
+        native = (int(info["width"] or 0), int(info["height"] or 0))
+        tw, th = self.texture_size_for(info["width"], info["height"])
+        if log:
+            self.log("畫面 %dx%d @ %.3g fps（%s），預覽用 %dx%d"
+                     % (info["width"], info["height"], info["fps"],
+                        info["codec"], tw, th))
+        return MED.FrameSource(q / "video.m4s", tw, th), native
+
+    def _install_loaded(self, item, local, q, vt, src, native, st):
+        """載入（或接著剪）完成：把影片放上編輯區。st 是收起來的狀態，新載入的是 None。"""
+        self._native = native
+        self._loaded_key = item.device_path
+        self.local, self.q_dir, self.vtrack = local, q, vt
+        self.duration = vt.duration_s()
+        self.bounds = vt.boundaries()
+        self.cuts = [list(c) for c in st["cuts"]] if st else []
+        self.mark_in = st["mark_in"] if st else None
+        self.mark_out = st["mark_out"] if st else None
+        self.playhead = st["playhead"] if st else 0.0
+        self.src = src
+        if src is not None:
+            self.set_preview_texture(src.out_w, src.out_h)
+            self.scrub.set_source(src)
+            self.player = MED.Player(src, q / "audio.m4s")
+            self.player.volume = self.cfg["volume"]
+            self.player.audio_offset = self.cfg["audio_offset_ms"] / 1000.0
+            self.apply_segments()
+            self.scrub.request(self.playhead)
+        else:
+            self.player = None
+            self.clear_preview()
+        self._sync_footer()
+        if st:
+            self.view_a, self.view_b = st["view"]
+            self.request_redraw()
+        else:
+            self.zoom_all()
+        self.refresh_cuts_ui()
+        self.progress(0.0, "")
+        self.post(self.rebuild_library)         # 清單上那支要標「已載入」
 
     def quality_dir_of(self, local):
         cand = [p for p in Path(local).iterdir()
@@ -2795,6 +3280,7 @@ class App(object):
         return "\n".join(lines)
 
     def unload_video(self):
+        self._loaded_key = None
         if self.player is not None:
             self.player.shutdown()
         self.player = None
@@ -2866,6 +3352,34 @@ class App(object):
 
     def clear_marks(self):
         self.mark_in = self.mark_out = None
+        self.refresh_cuts_ui()
+
+    def on_mark_edit(self, sender, app_data, user_data):
+        """草稿列的起點／終點輸入框：打時間改標記，清空就取消那個點。"""
+        side = user_data
+        text = (app_data or "").strip()
+        if not text:
+            t = None
+        else:
+            try:
+                t = max(0.0, min(parse_time(text), self.duration))
+            except ValueError:
+                self.log("時間格式看不懂：%r（可以寫 195、3:15 或 1:02:03.5）" % app_data)
+                self.refresh_cuts_ui()
+                return
+        if side == 0:
+            self.mark_in = t
+        else:
+            self.mark_out = t
+        if self.mark_in is not None and self.mark_out is not None \
+                and self.mark_out <= self.mark_in:
+            self.log("終點必須在起點後面。")
+            if side == 0:
+                self.mark_in = None
+            else:
+                self.mark_out = None
+        if t is not None:
+            self.seek_to(t)                     # 跳過去，看得到標在哪一格
         self.refresh_cuts_ui()
 
     def add_cut_from_marks(self):
@@ -2950,6 +3464,8 @@ class App(object):
         L = "cuts_list"
         if not dpg.does_item_exist(L):
             return
+        self._cell_inputs = []                   # 表格裡能改的時間格（_tick_inputs 用）
+        self._cell_on = None
         dpg.delete_item(L, children_only=True)
         W = int(self.tl_w) - px(11) - 2          # 右邊留給捲軸
         C = self._cut_cols(W)
@@ -3012,6 +3528,7 @@ class App(object):
                                        pos=(C[key][0] - px(4),
                                             y + (RH - ih) // 2))
                 self.theme(t, "cell")
+                self._cell_inputs.append(t)
                 self.font(t, "num")
                 with dpg.tooltip(t):
                     dpg.add_text("實際從這裡切（已吸附到 fragment 邊界）。你標的是 %s。\n"
@@ -3042,27 +3559,44 @@ class App(object):
                        track=False, pos=(0, y))
             y += 1
 
-        # 草稿列：正在標的這一段。I / O 是同一件事的快速鍵。
+        # 草稿列：正在標的這一段。還沒設是按鈕（設成播放位置，I / O 是快速鍵）；
+        # 設了之後變成輸入框，可以直接打數字改
         tick(y, LOOK.INK_3, 1)
-        for key, tag, empty, t, cb in (
-                ("a", "btn_mark_in", "設為起點  I", self.mark_in,
+        for side, key, tag, empty, t, cb in (
+                (0, "a", "btn_mark_in", "設為起點  I", self.mark_in,
                  self.set_mark_in),
-                ("b", "btn_mark_out", "設為終點  O", self.mark_out,
+                (1, "b", "btn_mark_out", "設為終點  O", self.mark_out,
                  self.set_mark_out)):
-            button(fmt_time(t, True) if t is not None else empty, key, y,
-                   "ghost_s", cb, tag=tag, width=C[key][1],
-                   role="num" if t is not None else "body")
-        if self.mark_in is not None and self.mark_out is not None:
+            if t is None:
+                button(empty, key, y, "ghost_s", cb, tag=tag, width=C[key][1])
+                continue
+            inp = dpg.add_input_text(default_value=fmt_time(t, True), tag=tag,
+                                     parent=L, width=C[key][1] + px(8),
+                                     user_data=side, on_enter=True,
+                                     callback=self.on_mark_edit,
+                                     pos=(C[key][0] - px(4), y + (RH - ih) // 2))
+            self.theme(inp, "cell")
+            self._cell_inputs.append(inp)
+            self.font(inp, "num")
+            with dpg.tooltip(inp):
+                dpg.add_text("可以直接改：打 195、3:15 或 1:02:03.5，按 Enter。\n"
+                             "按 %s 設成現在的播放位置；清空再按 Enter 就取消這個點。"
+                             % ("I" if side == 0 else "O"))
+        # 「加入移除區段」佔掉右邊幾欄：一顆按鈕做完「加入」，標記同時清空
+        first = "snap" if "snap" in C else "len"
+        if first == "snap" and self.mark_in is not None and self.mark_out is not None:
             text("%.1f s" % abs(self.mark_out - self.mark_in), "len", y)
-        button("加入", "look", y, "ink_s", self.add_cut_from_marks,
-               tag="btn_add_cut", width=C["look"][1] + px(8))
-        button("清除", "del", y, "link", self.clear_marks, tag="btn_clear_marks")
+        right = C["del"][0] + C["del"][1]
+        b = button("加入移除區段", first, y, "ink_s", self.add_cut_from_marks,
+                   tag="btn_add_cut", width=right - C[first][0])
+        with dpg.tooltip(b):
+            dpg.add_text("先設起點和終點，再按這裡把這段加進要移除的清單。")
         y += RH
         dpg.add_spacer(parent=L, height=1, pos=(0, y))
         if not loaded:
-            for tag in ("btn_mark_in", "btn_mark_out", "btn_add_cut",
-                        "btn_clear_marks"):
-                dpg.configure_item(tag, enabled=False)
+            for tag in ("btn_mark_in", "btn_mark_out", "btn_add_cut"):
+                if dpg.does_item_exist(tag):
+                    dpg.configure_item(tag, enabled=False)
 
     def on_snap(self, value):
         self.cfg["snap"] = "outer" if value == "外擴" else "inner"
@@ -3163,6 +3697,10 @@ class App(object):
     def y_foot(self):
         return self.TL_RULER + self.TL_CELLS + self.TL_BAND
 
+    @property
+    def y_scroll(self):
+        return self.y_foot + self.TL_FOOT
+
     def t2x(self, t):
         span = max(self.view_b - self.view_a, 1e-6)
         return (t - self.view_a) / span * self.tl_w
@@ -3241,16 +3779,30 @@ class App(object):
         try:
             a = dpg.get_item_rect_size("tp_a")[0]
             seg = dpg.get_item_rect_size("tp_seg")[0]
-            clk = dpg.get_item_rect_size("tp_clock")[0]
+            # 時間碼只算大字和小字（量得到的群組寬度晚一格才更新，而且會含下面那句）
+            clk = (dpg.get_item_rect_size("clock")[0]
+                   + dpg.get_item_rect_size("clock_sub")[0] + px(6))
         except Exception:
             return
-        if inner <= 0 or a <= 0 or clk <= 0:
+        if inner <= 0 or a <= 0 or clk <= px(6):
             return
-        narrow = a + seg + clk + 3 * px(14) + px(10) > inner
+        # 成品模式時間碼後面多一句「成品 · 原片在 …」。一列還是兩列只看「不算這句」
+        # 的寬度，這句有空位才顯示：不然一切到成品這句就把列撐爆、換成兩列，
+        # 切回原片又變回一列（使用者回報的怪換行）
+        note = dpg.get_value("clock_note") or ""
+        note_w = self.measure(note, "small") + px(6) if note else 0
+        need = a + seg + clk + 3 * px(14) + px(10)
+        # 留一點餘裕：剛好卡在邊界時不要每一格畫面都在一列／兩列之間換來換去
+        narrow = need > inner if not self._tp_narrow else need + px(24) > inner
         if narrow != self._tp_narrow:
             self._tp_narrow = narrow
             dpg.move_item("tp_b", parent="tp_row2" if narrow else "tp_row1")
             dpg.configure_item("tp_row2", show=narrow)
+        used = (seg + clk + px(14) + px(10)) if narrow else need
+        show = bool(note) and used + note_w <= inner
+        if show != getattr(self, "_note_shown", True):
+            self._note_shown = show
+            dpg.configure_item("clock_note", show=show)
 
     def _tick_desc(self):
         """時間軸標題旁的說明：放不下就截短，不要撞到右邊的按鈕。"""
@@ -3285,7 +3837,7 @@ class App(object):
                            parent=D)
 
         if self.vtrack is None:
-            self._set_desc("滾輪縮放 · 拖空白處平移 · 拖刪除號的兩端調整範圍",
+            self._set_desc("滾輪縮放 · 拖空白處或下面的捲軸左右移動（Shift+滾輪也行）· 拖刪除號的兩端調整範圍",
                            "切點只能落在格線上（fragment 邊界，約每 5 秒一格）")
             dpg.draw_rectangle((0, yc), (W, yb), fill=LOOK.PAPER_2,
                                color=LOOK.PAPER_2, parent=D)
@@ -3379,11 +3931,44 @@ class App(object):
                           color=LOOK.INK_2, parent=D)
         self.font(t, "small")
 
+        self._draw_scroll(W)
         self._draw_frame(W, H)
+
+    def _scroll_thumb(self, W):
+        """捲軸把手的左右緣（像素）。沒放大（整支都看得到）就回 None。"""
+        full = max(self.duration, 1.0)
+        if self.vtrack is None or self.view_b - self.view_a >= full - 1e-3:
+            return None
+        x0 = self.view_a / full * W
+        x1 = max(self.view_b / full * W, x0 + px(28))   # 放很大的時候也抓得到
+        if x1 > W:
+            x0, x1 = W - (x1 - x0), W
+        return x0, x1
+
+    def _draw_scroll(self, W):
+        D = "timeline"
+        y0 = self.y_scroll
+        y1 = y0 + self.TL_SCROLL
+        thumb = self._scroll_thumb(W)
+        if thumb is None:
+            return
+        full = max(self.duration, 1.0)
+        dpg.draw_rectangle((0, y0), (W, y1), fill=LOOK.PAPER_2, color=LOOK.PAPER_2,
+                           parent=D)
+        # 播放頭在整支裡的位置，方便知道現在看的是哪一段
+        xp = crisp(self.playhead / full * W)
+        dpg.draw_line((xp, y0 + px(2)), (xp, y1 - px(2)), color=LOOK.INK_2,
+                      thickness=1, parent=D)
+        hot = self._hover == ("scroll",) or (
+            self._drag is not None and self._drag.get("kind") == "thumb")
+        col = LOOK.INK_2 if hot else LOOK.INK_3
+        pad = px(3)
+        dpg.draw_rectangle((thumb[0] + 1, y0 + pad), (thumb[1] - 1, y1 - pad),
+                           fill=col, color=col, rounding=px(4), parent=D)
 
     def _draw_frame(self, W, H):
         D = "timeline"
-        for y in (self.y_cells, self.y_foot):
+        for y in (self.y_cells, self.y_foot, self.y_scroll):
             dpg.draw_line((0, crisp(y)), (W, crisp(y)), color=LOOK.GRID,
                           thickness=1, parent=D)
         dpg.draw_rectangle((0.5, 0.5), (W - 0.5, H - 0.5), color=LOOK.GRID,
@@ -3405,7 +3990,7 @@ class App(object):
         self._grid_k = k
         snap_word = "外擴" if self.cfg["snap"] == "outer" else "內縮"
         if k == 1:
-            self._set_desc("一格＝一個 fragment＝%.3f 秒 · 滾輪縮放 · 拖空白處平移"
+            self._set_desc("一格＝一個 fragment＝%.3f 秒 · 滾輪縮放 · 拖空白處或捲軸左右移動"
                            % avg_s,
                            "切點只能落在格線上 · %s吸附 · 音訊精切 ±23 ms"
                            % snap_word)
@@ -3519,6 +4104,10 @@ class App(object):
                 kind, idx, side = self.tl_hit(loc[0])
                 if kind == "edge":
                     hover = ("edge", idx, side)
+            elif loc is not None and loc[1] >= self.y_scroll:
+                thumb = self._scroll_thumb(self.tl_w)
+                if thumb is not None and thumb[0] <= loc[0] <= thumb[1]:
+                    hover = ("scroll",)
         if hover != self._hover:
             self._hover = hover
             self.request_redraw()
@@ -3556,7 +4145,21 @@ class App(object):
         loc = self.tl_local()
         if loc is None:
             return
-        lx, _ = loc
+        lx, ly = loc
+        if ly >= self.y_scroll:
+            thumb = self._scroll_thumb(self.tl_w)
+            if thumb is None:
+                return
+            if not thumb[0] <= lx <= thumb[1]:
+                # 點在把手外面：把那個位置移到正中間，接著可以直接拖
+                full = max(self.duration, 1.0)
+                span = self.view_b - self.view_a
+                a = lx / max(self.tl_w, 1) * full - span / 2.0
+                a = max(0.0, min(a, max(self.duration - span, 0.0)))
+                self.view_a, self.view_b = a, a + span
+                self.request_redraw()
+            self._drag = {"kind": "thumb", "x0": lx, "va": self.view_a}
+            return
         kind, idx, side = self.tl_hit(lx)
         t = self.x2t(lx)
         if kind == "edge":
@@ -3586,12 +4189,21 @@ class App(object):
         if not dpg.is_mouse_button_down(dpg.mvMouseButton_Left):
             self.on_mouse_release(None, [0])
             return
-        loc = self.tl_local()
-        if loc is None:
+        # 拖曳中只看水平位置：滑鼠跑出時間軸上下緣也繼續跟著走（以前一離開就停住）
+        try:
+            lx = dpg.get_mouse_pos(local=False)[0] - dpg.get_item_rect_min("timeline")[0]
+        except Exception:
             return
-        lx, _ = loc
         t = self.x2t(lx)
         d = self._drag
+        if d["kind"] == "thumb":
+            full = max(self.duration, 1.0)
+            span = self.view_b - self.view_a
+            a = d["va"] + (lx - d["x0"]) / max(self.tl_w, 1) * full
+            a = max(0.0, min(a, max(self.duration - span, 0.0)))
+            self.view_a, self.view_b = a, a + span
+            self.request_redraw()
+            return
         if d["kind"] == "pan":
             if abs(lx - d["x0"]) > 3:
                 d["moved"] = True
@@ -3622,8 +4234,15 @@ class App(object):
         if loc is None or self.vtrack is None:
             return
         lx, _ = loc
-        anchor = self.x2t(lx)
         span = self.view_b - self.view_a
+        if dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift):
+            # Shift + 滾輪：左右移動，一格移看得到的範圍的 15%
+            a = self.view_a + span * (-0.15 if app_data > 0 else 0.15)
+            a = max(0.0, min(a, max(self.duration - span, 0.0)))
+            self.view_a, self.view_b = a, a + span
+            self.request_redraw()
+            return
+        anchor = self.x2t(lx)
         factor = 0.8 if app_data > 0 else 1.25
         new = max(min(span * factor, max(self.duration, 1.0)), 0.5)
         frac = (anchor - self.view_a) / max(span, 1e-6)
@@ -3632,17 +4251,28 @@ class App(object):
         self.view_a, self.view_b = a, a + new
         self.request_redraw()
 
-    @staticmethod
-    def _typing():
-        """游標在輸入框裡的時候，快速鍵要讓位給打字。"""
-        try:
-            focused = dpg.get_focused_item()
-            if not focused:
-                return False
-            kind = dpg.get_item_info(focused).get("type", "")
-        except Exception:
-            return False
-        return "Input" in kind
+    # 有提示字（placeholder）的輸入框；表格裡的時間格和 Wi-Fi 清單裡的配對碼另外記
+    HINTED = ("lib_filter", "wifi_ip", "wifi_pair_addr", "wifi_code", "wifi_conn_addr")
+
+    def _active_input(self):
+        """
+        正在編輯（有游標）的輸入框，沒有就回 None。
+        不能用 dpg.get_focused_item()：實測它回的常常是別的東西（滑過的 drawlist），
+        不是正在打字的那格。所以直接一格一格問 is_item_active。
+        """
+        cand = list(getattr(self, "_cell_inputs", ()))
+        cand += list(self.HINTED) + list(getattr(self, "_wifi_code_inputs", ()))
+        for t in cand:
+            try:
+                if dpg.does_item_exist(t) and dpg.is_item_active(t):
+                    return t
+            except Exception:
+                pass
+        return None
+
+    def _typing(self):
+        """正在輸入框裡打字的時候，快速鍵（空白鍵、I、O、方向鍵）要讓位給打字。"""
+        return self._active_input() is not None
 
     def on_key(self, sender, app_data):
         if self.vtrack is None or self._typing():
@@ -3665,6 +4295,33 @@ class App(object):
     # 每一幀
     # ======================================================================= #
 
+    def _tick_inputs(self):
+        """
+        輸入框正在編輯時：
+        - 提示字（placeholder）先拿掉。Dear PyGui 的提示字要等打了字才消失，
+          游標閃在提示字前面，看起來像提示字是內容。離開後再放回去。
+        - 區間表的時間格換成白底墨框，看得出現在在改哪一格（平常它們像一般的字）。
+        """
+        f = self._active_input()
+        held = getattr(self, "_hint_held", None)          # (item, 原本的提示字)
+        if held and held[0] != f:
+            if dpg.does_item_exist(held[0]):
+                dpg.configure_item(held[0], hint=held[1])
+            self._hint_held = held = None
+        if f is not None and held is None:
+            hint = dpg.get_item_configuration(f).get("hint") or ""
+            if hint:
+                dpg.configure_item(f, hint="")
+                self._hint_held = (f, hint)
+        cell = f if f is not None and f in getattr(self, "_cell_inputs", ()) else None
+        if cell != getattr(self, "_cell_on", None):
+            old = getattr(self, "_cell_on", None)
+            if old is not None and dpg.does_item_exist(old):
+                self.theme(old, "cell")
+            if cell is not None:
+                self.theme(cell, "cell_on")
+            self._cell_on = cell
+
     def tick(self):
         self.pump()
         self._tick_later()
@@ -3676,6 +4333,7 @@ class App(object):
         self.tick_drag()
         self._tick_hover()
         self._tick_watch()
+        self._tick_inputs()
 
         frame = None
         if self.player is not None and self.player.playing:
@@ -3890,6 +4548,10 @@ class App(object):
             return dest
 
         def done(dest):
+            # 暫存的檔案已經換成剪過的版本，記憶體裡那份（原片的 fragment 和區間）
+            # 對不上了：之後換去別支就不收起來，回來要重新載入
+            self._sessions.pop(item.device_path, None)
+            self._loaded_key = None
             self.log("寫入完成。備份在 %s" % dest)
             self.log("去 B站 App 播一下確認。如果不滿意，用「備份 → 還原備份」"
                      "把原檔放回去。")

@@ -75,6 +75,11 @@ DEFAULTS = {
     "wifi_last": "",
     # IP -> 手機型號，「找手機」列表顯示用
     "wifi_names": {},
+    # 無線偵錯 guid（adb-<序號>-xxx）-> 手機型號：配對過但不在網路上的手機，
+    # 清單裡也寫得出名字
+    "wifi_models": {},
+    # IP -> guid：自己試埠號找到的手機只知道 IP，靠這個對回是哪支配對過的手機
+    "wifi_guids": {},
 }
 
 
