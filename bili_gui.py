@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import dearpygui.dearpygui as dpg
 
+import bili_accel as ACC
 import bili_backup as BK
 import bili_config as CFG
 import bili_device as DEV
@@ -2245,6 +2246,8 @@ class App(object):
                 ("btn_zoom_all", loaded),
                 ("btn_zoom_seam", loaded and has_cuts),
                 ("btn_rescan", not self.busy),
+                ("btn_accel", not self.busy and self.device is not None),
+                ("btn_accel_all", not self.busy and self.device is not None),
         ) + tuple(("tp_%d" % i, loaded) for i in range(7)):
             if dpg.does_item_exist(tag):
                 dpg.configure_item(tag, enabled=bool(on))
@@ -2574,6 +2577,10 @@ class App(object):
             self.log("共 %d 支緩存影片，其中 %d 支可以處理。"
                      % (len(items),
                         sum(1 for i in items if i.unsupported_reason() is None)))
+            pend = ACC.pending_items(items)
+            if pend:
+                self.log("有 %d 支還沒下載完，選它按「用電腦代下載」，"
+                         "電腦會幫手機把檔案下載好。" % len(pend))
             self._sync_device_ui()
             self.rebuild_library()
             self.progress(0.0, "")
@@ -2798,7 +2805,10 @@ class App(object):
             sel = it is self.item
             role = self.role_for(it.display_name, "strong" if sel else "body")
             lines = self.wrap(it.display_name, role, text_w, 2)
-            why = self.wrap("不能剪：" + bad, "small", text_w, 2) if bad else []
+            if ACC.is_pending(it):
+                bad = "還沒下載完，可以用電腦代下載"
+            why = self.wrap(bad if ACC.is_pending(it) else "不能剪：" + bad,
+                            "small", text_w, 2) if bad else []
             h = (px(10) + len(lines) * (lh + px(4)) + px(2) + lh_s
                  + (px(5) + len(why) * (lh_s + px(3)) if why else 0) + px(10))
             dpg.add_selectable(label="", tag="sel_%d" % n, parent="lib_list",
@@ -3019,6 +3029,10 @@ class App(object):
 
         P = outer
 
+        if ACC.is_pending(it):
+            self._accel_actions(A, W, it)
+            return
+
         bad = it.unsupported_reason()
         if bad:
             self.hrule(LOOK.PAPER_3, 1, width=W, parent=A, track=False)
@@ -3079,6 +3093,83 @@ class App(object):
             warn += "檔案大小維持 {:,} bytes —— 手機容量不會變少。".format(vb)
         self.font(dpg.add_text(warn, parent=A, wrap=W, color=LOOK.INK_2),
                   "small")
+
+    # ======================================================================= #
+    # 電腦代下載
+    # ======================================================================= #
+
+    def _accel_actions(self, A, W, it):
+        """沒下載完的那支：右欄放代下載的說明和按鈕。"""
+        done, total = it.downloaded_bytes or 0, it.total_bytes or 0
+        self.hrule(LOOK.PAPER_3, 1, width=W, parent=A, track=False)
+        state = ("手機上下載到 %s / %s。" % (fmt_bytes(done), fmt_bytes(total))
+                 if total else "手機上還在下載。")
+        self.font(dpg.add_text(
+            state + "電腦可以把同一份檔案下載好推過去，"
+            "之後在 App 裡按「繼續」就直接完成。", parent=A, wrap=W,
+            color=LOOK.INK_2), "small")
+        b = dpg.add_button(label="用電腦代下載", tag="btn_accel", parent=A,
+                           width=W, height=px(44),
+                           callback=lambda: self.on_accel_clicked(False))
+        self.theme(b, "ink")
+        self.font(b, "strong")
+        n = len(ACC.pending_items(self.items))
+        if n > 1:
+            b = dpg.add_button(label="沒下載完的 %d 支全部代下載" % n,
+                               tag="btn_accel_all", parent=A, width=W,
+                               height=px(34),
+                               callback=lambda: self.on_accel_clicked(True))
+            self.theme(b, "ghost")
+            self.font(b, "small")
+        self.font(dpg.add_text(
+            "會先關掉手機上的 B站 App。檔案推完就從電腦刪掉，不另存。",
+            parent=A, wrap=W, color=LOOK.INK_2), "small")
+
+    def on_accel_clicked(self, every):
+        if self.device is None:
+            self.log("沒有連上裝置。")
+            return
+        targets = ACC.pending_items(self.items) if every else \
+            [self.item] if self.item is not None else []
+        if not targets:
+            self.log("手機上沒有還沒下載完的緩存。")
+            return
+        device = self.device
+        work_dir = self.stage_dir
+
+        def work():
+            ok, failed = [], []
+            for n, it in enumerate(targets, 1):
+                self.log("電腦代下載（%d/%d）：%s"
+                         % (n, len(targets), it.display_name))
+                try:
+                    r = ACC.accelerate(device, it, work_dir,
+                                       progress=self._mk_progress(), log=self.log)
+                    ok.append((it, r))
+                except ACC.AccelError as e:
+                    self.log("  代下載失敗：%s" % e)
+                    failed.append(it)
+            if ok:
+                try:
+                    ACC.open_app(device, ok[0][0].root.package)
+                except DEV.AdbError:
+                    pass
+            return ok, failed
+
+        def done(res):
+            ok, failed = res
+            self.progress(0.0, "")
+            if ok:
+                size = sum(r["bytes"] for _, r in ok)
+                secs = sum(r["download_s"] for _, r in ok)
+                self.log("代下載好 %d 支（%s，電腦下載花 %.0f 秒）。手機上已經打開"
+                         " B站：到「離線緩存 → 下載中」按繼續（或全部開始），App 會"
+                         "直接判定下載完成。好了之後按「重新掃描手機」。"
+                         % (len(ok), fmt_bytes(size), secs))
+            if failed:
+                self.post(self.show_log)
+
+        self.run_worker("電腦代下載", work, done)
 
     @property
     def stage_dir(self):

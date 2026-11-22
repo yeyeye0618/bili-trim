@@ -29,7 +29,7 @@ from pathlib import Path
 
 # 版本號放這裡：bili_env 是唯一一個每個模組都會載入的共用檔案。
 # 回報問題時附上的 --check 輸出第一行就要寫明是哪一版。
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 HERE = Path(__file__).resolve().parent
 
