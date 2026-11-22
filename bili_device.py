@@ -466,8 +466,12 @@ def ask_again():
 #   連線（之後每次）：  「無線偵錯」主畫面上的「IP 位址和通訊埠」 -> adb connect
 #
 # 手機重開機或換 Wi-Fi 之後無線偵錯會關掉、埠號會變；配對不用重做。
-# 埠號可以不必手打：手機開著無線偵錯時會在區網廣播（mDNS），adb mdns services
-# 看得到 —— 配對視窗開著的時候連配對用的那組也看得到。
+# 埠號可以不必手打：手機開著無線偵錯時會在區網廣播（mDNS），bili_mdns 看得到
+# —— 配對視窗開著的時候連配對用的那組也看得到。
+#
+# 最省事的配對是 QR 圖碼：電腦畫一張 WIFI:T:ADB;S:<名稱>;P:<密碼>;; 的 QR，
+# 手機「使用 QR 圖碼配對裝置」掃了之後，會用 <名稱> 廣播一個配對服務，
+# 電腦看到就用 <密碼> 配對。使用者什麼都不用打。
 #
 # 藍芽沒有這條路：adb 只能走 USB 或網路。
 
@@ -508,25 +512,215 @@ def _run_any(args, timeout):
     return r.returncode, text
 
 
+def _adb_log_path():
+    """adb 背景服務自己的記錄檔：Windows 是暫存資料夾裡的 adb.log，其他系統 /tmp/adb.<uid>.log。"""
+    import tempfile
+    if os.name == "nt":
+        return os.path.join(tempfile.gettempdir(), "adb.log")
+    return "/tmp/adb.%d.log" % os.getuid()
+
+
+def _log_size():
+    try:
+        return os.path.getsize(_adb_log_path())
+    except OSError:
+        return None
+
+
+def _log_since(size):
+    """記錄檔從 size 之後新寫進去的部分（拿不到就空字串）。"""
+    if size is None:
+        return ""
+    try:
+        with open(_adb_log_path(), "rb") as f:
+            f.seek(size)
+            return f.read(64 * 1024).decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _pair_raw(addr, password, timeout=30):
+    """
+    跑一次 adb pair。回傳 (成功?, 原因)。原因是 "code"（配對碼不對）、
+    "reach"（連不到配對埠）或 adb 的原話。
+
+    實測（adb 37.0.3，Windows）：配對失敗時 adb 一律只印
+    「protocol fault (couldn't read status message)」，連 IP 打錯都是這句。
+    真正的原因只寫在背景服務的記錄檔裡，所以失敗了去那裡看：
+      Failed to decrypt / Unable to decrypt data   -> 配對碼不對（SPAKE2 對不起來）
+      Failed to start pairing connection client     -> 連不到
+    """
+    before = _log_size()
+    rc, out = _run_any(["pair", addr, password], timeout)
+    if "successfully paired" in out.lower():
+        return True, ""
+    low = (out + " " + _log_since(before)).lower()
+    if ("wrong password" in low or "decrypt" in low
+            or "connection was dropped" in low):
+        return False, "code"
+    if (rc == -1 or "unable to start pairing" in low or "failed to connect" in low
+            or "failed to start pairing" in low or "cannot connect" in low):
+        return False, "reach"
+    return False, (out.splitlines()[-1] if out else "（沒有訊息）")
+
+
 def pair(addr, code, timeout=30):
-    """配對。成功就安靜回來，失敗丟 AdbError（訊息講下一步怎麼做）。"""
+    """用 6 位數配對碼配對。成功就安靜回來，失敗丟 AdbError（訊息講下一步怎麼做）。"""
     addr = parse_addr(addr)
     code = re.sub(r"\D", "", code or "")
     if len(code) != 6:
         raise ValueError("配對碼是手機上顯示的 6 位數字")
-    rc, out = _run_any(["pair", addr, code], timeout)
-    if "successfully paired" in out.lower():
+    ok, why = _pair_raw(addr, code, timeout)
+    if ok:
         return
-    low = out.lower()
-    if "wrong password" in low or "connection was dropped" in low:
+    if why == "code":
         why = "配對碼不對，或手機上的配對視窗已經關了 —— 重新點一次「使用配對碼配對裝置」再試。"
-    elif (rc == -1 or "unable to start pairing" in low or "failed to connect" in low
-          or "protocol fault" in low or "cannot connect" in low):
+    elif why == "reach":
         why = ("連不到手機的配對埠。確認：IP:埠號是「使用配對碼配對裝置」那個視窗裡的"
                "（不是無線偵錯主畫面那組）、視窗還開著、手機和電腦連同一個 Wi-Fi。")
     else:
-        why = "adb 說：%s" % (out.splitlines()[-1] if out else "（沒有訊息）")
+        why = "adb 說：%s" % why
     raise AdbError("配對失敗。" + why)
+
+
+def pair_qr(addr, password, quoted, timeout=30):
+    """
+    QR 圖碼配對：手機掃了電腦畫的 QR 之後，用 QR 裡的密碼配對一次。
+    回傳 (成功?, 原因)，原因同 _pair_raw。
+
+    實測（vivo V2144）：手機把 QR 裡的名稱和密碼都包上一層雙引號（把它當成 Wi-Fi
+    的 SSID／密碼處理），真正的密碼是 "123456" 連引號；原生 Android 不包。
+    手機廣播的服務名稱有沒有引號就看得出是哪一種，呼叫端照那個傳 quoted。
+    密碼不對時手機會換一個埠重開配對服務（還在轉圈），呼叫端可以等它重新
+    廣播後，用另一種再試一次。
+    """
+    return _pair_raw(addr, '"%s"' % password if quoted else password, timeout)
+
+
+def known_hosts_path():
+    home = os.environ.get("ANDROID_USER_HOME") or \
+        os.path.join(os.path.expanduser("~"), ".android")
+    return os.path.join(home, "adb_known_hosts.pb")
+
+
+def paired_guids():
+    """
+    這台電腦配對過的手機（無線偵錯的 guid，像 adb-10AC560570000XY-L4INxH）。
+    adb 配對成功會把手機的 guid 寫進 ~/.android/adb_known_hosts.pb（protobuf，
+    裡面就是一串 guid 字串），手機廣播的「連線」服務名稱就是同一個 guid。
+    """
+    try:
+        with open(known_hosts_path(), "rb") as f:
+            data = f.read()
+    except OSError:
+        return set()
+    return set(m.decode("ascii") for m in re.findall(rb"adb-[A-Za-z0-9]+-[A-Za-z0-9]+", data))
+
+
+# ---- 清除配對 ----
+#
+# 配對其實是兩邊各記一筆：
+#   電腦：adb_known_hosts.pb 裡手機的 guid。adb 只會自動連這裡面有的手機。
+#   手機：這台電腦的公鑰（~/.android/adbkey.pub）。手機認得公鑰就讓它連。
+#
+# 實測（vivo V2144）：電腦這邊拿掉 guid 之後，adb 就不再自動連它；但手機還認得
+# 公鑰，所以 adb connect IP:埠號 照樣連得上。手機那邊沒辦法從電腦清：
+# cmd adb 只有 is-wifi-supported 之類的查詢，存公鑰的 /data/misc/adb 要 root
+# 才讀得到。只能請使用者在手機上「已配對的裝置」裡按「忘記」。
+
+def _varint(b, i):
+    n = shift = 0
+    while True:
+        c = b[i]
+        i += 1
+        n |= (c & 0x7F) << shift
+        shift += 7
+        if not c & 0x80:
+            return n, i
+
+
+def _pb_fields(data):
+    """protobuf 最外層的欄位 -> [(欄位編號, 這個欄位的原始位元組), ...]。"""
+    i, out = 0, []
+    while i < len(data):
+        start = i
+        key, i = _varint(data, i)
+        wt = key & 7
+        if wt == 2:
+            n, i = _varint(data, i)
+            i += n
+        elif wt == 0:
+            _, i = _varint(data, i)
+        elif wt == 1:
+            i += 8
+        elif wt == 5:
+            i += 4
+        else:
+            raise ValueError("wire type %d" % wt)
+        if i > len(data):
+            raise ValueError("truncated")
+        out.append((key >> 3, data[start:i]))
+    return out
+
+
+def forget_paired(guid):
+    """
+    把手機的 guid 從 adb_known_hosts.pb 拿掉（電腦這邊的配對）。檔案格式是
+    AdbKnownHosts { repeated HostInfo host_infos = 1; }，HostInfo 裡只有 guid。
+    只拿掉含這個 guid 的那幾筆，其他原封不動。回傳有沒有拿掉東西。
+    """
+    path = known_hosts_path()
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    try:
+        fields = _pb_fields(data)
+    except (ValueError, IndexError):
+        raise AdbError("看不懂 %s，沒有動它。" % path)
+    want = guid.encode("ascii")
+    keep = [raw for no, raw in fields if not (no == 1 and want in raw)]
+    if len(keep) == len(fields):
+        return False
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(b"".join(keep))
+    os.replace(tmp, path)
+    return True
+
+
+def pc_name():
+    """手機「已配對的裝置」裡顯示的這台電腦的名字（adbkey.pub 最後那段，像 user@HOST）。"""
+    try:
+        with open(os.path.join(os.path.dirname(known_hosts_path()), "adbkey.pub"),
+                  encoding="utf-8", errors="replace") as f:
+            parts = f.read().split()
+        return parts[-1] if len(parts) >= 2 else ""
+    except OSError:
+        return ""
+
+
+def guid_of(serial):
+    """
+    一條 Wi-Fi 連線是哪支配對過的手機。mDNS 連的序號本身就是 guid；IP:埠號 連的
+    就問手機的 ro.serialno，去配對清單裡找 adb-<序號>-xxx。找不到回空字串。
+    """
+    inst = serial.split("._adb-tls-", 1)[0]
+    if "._adb-tls-" in serial and inst.startswith("adb-"):
+        return inst
+    if not _ADDR.match(serial):
+        return ""
+    sn = _SERIALNO.get(serial)
+    if sn is None:
+        try:
+            sn = _run(["-s", serial, "shell", "getprop", "ro.serialno"], timeout=8).strip()
+        except AdbError:
+            sn = ""
+        _SERIALNO[serial] = sn
+    if not sn:
+        return ""
+    return next((g for g in paired_guids() if g.startswith("adb-%s-" % sn)), "")
 
 
 def connect(addr, timeout=20):
@@ -571,13 +765,28 @@ def parse_mdns(text):
     return found
 
 
-def discover(timeout=10):
-    """區網上開著無線偵錯的手機。adb 太舊或 mDNS 不能用就回空的，不丟例外。"""
+def discover(timeout=3):
+    """
+    區網上開著無線偵錯的手機。adb 太舊或 mDNS 不能用就回空的，不丟例外。
+    先用自己的 mDNS（每張網卡都問，見 bili_mdns），再併上 adb 自己看到的。
+    """
+    import bili_mdns
+    found = {"pair": [], "connect": []}
+    try:
+        for sv in bili_mdns.browse(min(timeout, 3)):
+            key = "pair" if sv.kind == "pairing" else "connect"
+            found[key].append((sv.instance, sv.addr))
+    except OSError:
+        pass
     try:
         rc, out = _run_any(["mdns", "services"], timeout)
+        extra = parse_mdns(out)
     except AdbError:
-        return {"pair": [], "connect": []}
-    return parse_mdns(out)
+        extra = {"pair": [], "connect": []}
+    for key in found:
+        have = set(a for _, a in found[key])
+        found[key] += [(n, a) for n, a in extra[key] if a not in have]
+    return found
 
 
 # ---- 自己找埠號 ----
@@ -683,6 +892,42 @@ def drop_stale(host=None):
             continue
         if host is None or host_of(serial) == host:
             disconnect(serial)
+
+
+_SERIALNO = {}          # IP:埠號 -> 手機的 ro.serialno（問過就記著）
+
+
+def drop_duplicate_wifi(devs):
+    """
+    同一支手機用 Wi-Fi 連了兩條（一條 IP:埠號，一條 adb 用 mDNS 自己連的
+    adb-<序號>-xxx._adb-tls-connect._tcp）時，中斷 IP:埠號 那條，回傳剩下的。
+    mDNS 那條留著：手機換埠號之後 adb 會自己跟著連，IP:埠號 那條不會。
+    手機的序號只有問了才知道（ro.serialno），每條 IP 連線只問一次。
+    """
+    by_guid = set()
+    for d in devs:
+        inst = d.serial.split("._adb-tls-", 1)[0]
+        if "._adb-tls-connect." in d.serial and inst.startswith("adb-") \
+                and inst.count("-") >= 2:
+            by_guid.add(inst[4:].rsplit("-", 1)[0])
+    if not by_guid:
+        return devs
+    keep = []
+    for d in devs:
+        if _ADDR.match(d.serial):
+            sn = _SERIALNO.get(d.serial)
+            if sn is None:
+                try:
+                    sn = _run(["-s", d.serial, "shell", "getprop", "ro.serialno"],
+                              timeout=8).strip()
+                except AdbError:
+                    sn = ""
+                _SERIALNO[d.serial] = sn
+            if sn and sn in by_guid:
+                disconnect(d.serial)
+                continue
+        keep.append(d)
+    return keep
 
 
 def host_reachable(host, timeout_ms=800):

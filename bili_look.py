@@ -154,6 +154,10 @@ def make_themes(px):
                 (C.mvThemeCol_NavHighlight, INK),
                 (C.mvThemeCol_ModalWindowDimBg, (18, 16, 16, 110)),
             ))
+            # 輸入框的游標有自己的顏色。沒設的話留著 Dear PyGui 深色主題的預設
+            # （接近白色），在紙色底上幾乎看不見 —— 使用者以為輸入框不能打字
+            if hasattr(C, "mvThemeCol_InputTextCursor"):
+                dpg.add_theme_color(C.mvThemeCol_InputTextCursor, INK)
             _styles((
                 (C.mvStyleVar_WindowRounding, 0),
                 (C.mvStyleVar_ChildRounding, 0),
@@ -311,6 +315,16 @@ def make_themes(px):
             dpg.add_theme_style(C.mvStyleVar_FrameBorderSize, 0)
             dpg.add_theme_style(C.mvStyleVar_FramePadding, px(4), px(3))
     T["cell"] = th
+
+    with dpg.theme() as th:          # 正在改的那格：白底墨框，一眼看得出在改哪裡
+        with dpg.theme_component(dpg.mvAll):
+            _colors(((C.mvThemeCol_FrameBg, (255, 255, 255, 255)),
+                     (C.mvThemeCol_FrameBgHovered, (255, 255, 255, 255)),
+                     (C.mvThemeCol_FrameBgActive, (255, 255, 255, 255)),
+                     (C.mvThemeCol_Border, INK)))
+            dpg.add_theme_style(C.mvStyleVar_FrameBorderSize, 1)
+            dpg.add_theme_style(C.mvStyleVar_FramePadding, px(4), px(3))
+    T["cell_on"] = th
 
     # ---- 進度條：墨色填進紙槽 ----
     with dpg.theme() as th:
