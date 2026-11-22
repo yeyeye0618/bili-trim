@@ -12,7 +12,7 @@ bili_mdns.py — 自己在區網上找開著「無線偵錯」的手機（mDNS /
      單播直接回到這個埠（legacy unicast），不必搶 5353。
   2. 自己也綁 5353（SO_REUSEADDR，跟 Windows 和 adb 共用）、加入群播，
      收群播的回應和手機自己發的公告。
-  實測（vivo V2144）：「連線」服務兩種都會回，「配對」服務只用群播回 ——
+  實測（部分手機）：「連線」服務兩種都會回，「配對」服務只用群播回 ——
   只做第 1 種的話永遠看不到配對視窗。
 
 手機開著無線偵錯時會廣播兩種服務：
@@ -50,7 +50,7 @@ class Service(object):
     def instance(self):
         """
         服務名稱的第一段：adb-<序號>-<亂碼>，或 QR 配對時電腦自己取的名字。
-        實測（vivo V2144）：QR 配對的名字會被手機包上一層雙引號 —— Android 把 QR
+        實測（部分手機）：QR 配對的名字會被手機包上一層雙引號 —— Android 把 QR
         裡的 S 當成 Wi-Fi 的 SSID 處理，SSID 習慣加引號 —— 所以這裡拿掉。
         """
         return self.name.split("._adb-tls-", 1)[0].strip('"')
